@@ -339,7 +339,9 @@ pub fn download(
         for object in objects["objects"]
             .as_object()
             .into_iter()
-            .flat_map(|o| o.values())
+            .flat_map(|o| o.iter())
+            .filter(|(name, _)| used_by_starling(name))
+            .map(|(_, object)| object)
         {
             let Some(hash) = object["hash"]
                 .as_str()
@@ -363,6 +365,23 @@ pub fn download(
         client_jar,
         server_jar,
     })
+}
+
+/// The asset names the preparation copies into the game's resources (sounds, the title
+/// panorama, fonts, the built-in packs and the languages: horizon-prepare's `sounds.rs`).
+/// The rest of the asset store (icons, texts and so on) is never read, so it is not fetched.
+fn used_by_starling(name: &str) -> bool {
+    name == "pack.mcmeta"
+        || name == "minecraft/sounds.json"
+        || [
+            "minecraft/sounds/",
+            "minecraft/textures/gui/title/background/",
+            "minecraft/font/",
+            "minecraft/resourcepacks/",
+            "minecraft/lang/",
+        ]
+        .iter()
+        .any(|prefix| name.starts_with(prefix))
 }
 
 /// Every item, a few at a time; what is already there with its hash counts as done.
