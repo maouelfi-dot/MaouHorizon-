@@ -1,0 +1,8 @@
+Maou Horizon 0.8.2 - rilis otomatis
+1. Versi dinaikkan ke 0.8.2 (VERSION_CODE 14) di packaging/android/build_apk.py.
+2. .github/workflows/android.yml: branch preview-0.8.1-2 ikut dibuild, dan job baru "maou-release" mengunggah
+   semua APK ke Releases (tag v0.8.2) setelah semua arsitektur selesai. Push berikutnya memperbarui rilis yang sama.
+3. packaging/android/release-notes.md diganti: hanya catatan fitur baru.
+Pasang SETELAH perbaikan branch (MaouHorizon-preview-0.8.1-2-fix.zip) dan di branch preview-0.8.1-2:
+  unzip -o MaouHorizon-0.8.2-release.zip -d rel && cp -r rel/. .
+  git add -A && git commit -m "0.8.2: rilis otomatis ke Releases" && git push origin preview-0.8.1-2

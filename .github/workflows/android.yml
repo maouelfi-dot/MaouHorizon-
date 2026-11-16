@@ -12,7 +12,7 @@ name: android
 # STARLING_DEBUG_KEYSTORE_BASE64 (alias horizon-debug, password android); a tag there publishes nothing.
 on:
   push:
-    branches: [android, starling, integration]
+    branches: [android, starling, integration, preview-0.8.1-2]
     tags: ['v*']
   pull_request:
     types: [opened, synchronize, reopened]
@@ -186,3 +186,35 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: gh workflow run native-mods.yml -R "$GITHUB_REPOSITORY" --ref android -f version="${GITHUB_REF_NAME#v}"
+
+  # [Maou] Setelah SEMUA arsitektur selesai dibuild, APK langsung diunggah ke Releases repo ini (tanpa kunci rilis
+  # Starling: APK Preview bertanda tangan kunci uji repo). Tag = v<VERSION_NAME dari build_apk.py>; push berikutnya
+  # ke branch yang sama memperbarui rilis dan APK-nya.
+  maou-release:
+    needs: apk
+    if: github.event_name == 'push' && github.ref == 'refs/heads/preview-0.8.1-2' && github.repository == 'maouelfi-dot/MaouHorizon-'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: starling-apk-*
+          path: target/android
+          merge-multiple: true
+      - name: Publish the APKs to Releases
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          VER=$(sed -n 's/^VERSION_NAME = "\(.*\)"/\1/p' packaging/android/build_apk.py)
+          TAG="v$VER"
+          ls -la target/android
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" target/android/starling-*.apk --clobber
+            gh release edit "$TAG" --title "Maou Horizon $VER" --notes-file packaging/android/release-notes.md
+          else
+            gh release create "$TAG" target/android/starling-*.apk \
+              --target "$GITHUB_SHA" --title "Maou Horizon $VER" \
+              --notes-file packaging/android/release-notes.md --latest
+          fi
