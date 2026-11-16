@@ -3,6 +3,7 @@
 //! `[MOTD]text[/MOTD][AD]port[/AD]`, and LanServerDetection collects those
 //! announcements for the multiplayer screen.
 use std::{
+    collections::HashMap,
     io,
     net::{Ipv4Addr, SocketAddr, SocketAddrV4, UdpSocket},
     sync::{
@@ -67,6 +68,33 @@ pub fn add_server(games: &mut Vec<LanGame>, ping: &str, ip: &str) -> bool {
     true
 }
 
+/// The subnet broadcast address of `ip` on a network with `netmask`.
+pub fn broadcast_address(ip: Ipv4Addr, netmask: Ipv4Addr) -> Ipv4Addr {
+    Ipv4Addr::from(u32::from(ip) | !u32::from(netmask))
+}
+
+/// The IPv4 networks this device is on, loopback and link-local left out: `(address, broadcast)`.
+/// A phone's hotspot is one of them while it is on, and the multicast group alone does not
+/// reach it (the group goes out of the default network only), so announcements also go to each
+/// network's broadcast address (Maou Horizon's "Mabar").
+pub fn local_networks() -> Vec<(Ipv4Addr, Ipv4Addr)> {
+    let Ok(interfaces) = if_addrs::get_if_addrs() else {
+        return Vec::new();
+    };
+    interfaces
+        .into_iter()
+        .filter_map(|interface| match interface.addr {
+            if_addrs::IfAddr::V4(v4) if !v4.ip.is_loopback() && !v4.ip.is_link_local() => {
+                let broadcast = v4
+                    .broadcast
+                    .unwrap_or_else(|| broadcast_address(v4.ip, v4.netmask));
+                Some((v4.ip, broadcast))
+            }
+            _ => None,
+        })
+        .collect()
+}
+
 /// Announces one hosted world until dropped.
 pub struct Pinger {
     stop: Arc<AtomicBool>,
@@ -82,8 +110,29 @@ impl Pinger {
             .name("horizon-lan-ping".into())
             .spawn(move || {
                 let target = SocketAddr::V4(SocketAddrV4::new(GROUP, PORT));
+                // One socket per network, bound to its own address so the announcement
+                // names that address: the one a guest on that network can reach.
+                let mut per_network: HashMap<Ipv4Addr, UdpSocket> = HashMap::new();
                 while !flag.load(Ordering::Relaxed) {
                     let _ = socket.send_to(message.as_bytes(), target);
+                    let networks = local_networks();
+                    per_network.retain(|ip, _| networks.iter().any(|(n, _)| n == ip));
+                    for (ip, broadcast) in networks {
+                        let network_socket = match per_network.entry(ip) {
+                            std::collections::hash_map::Entry::Occupied(e) => e.into_mut(),
+                            std::collections::hash_map::Entry::Vacant(e) => {
+                                let Ok(s) = UdpSocket::bind((ip, 0)) else {
+                                    continue;
+                                };
+                                let _ = s.set_broadcast(true);
+                                e.insert(s)
+                            }
+                        };
+                        let _ = network_socket.send_to(
+                            message.as_bytes(),
+                            SocketAddr::V4(SocketAddrV4::new(broadcast, PORT)),
+                        );
+                    }
                     let mut slept = Duration::ZERO;
                     while slept < INTERVAL && !flag.load(Ordering::Relaxed) {
                         std::thread::sleep(Duration::from_millis(50));
@@ -178,6 +227,10 @@ impl Scanner {
 fn bind_listener() -> io::Result<UdpSocket> {
     let socket = UdpSocket::bind(("0.0.0.0", PORT))?;
     socket.join_multicast_v4(&GROUP, &Ipv4Addr::UNSPECIFIED)?;
+    // Also on each network (a hotspot's included); broadcasts reach the bound port as they are.
+    for (ip, _) in local_networks() {
+        let _ = socket.join_multicast_v4(&GROUP, &ip);
+    }
     socket.set_read_timeout(Some(Duration::from_millis(250)))?;
     Ok(socket)
 }
@@ -226,6 +279,24 @@ mod tests {
             "10.0.0.4",
         );
         assert_eq!(scanner.take_found()[0].1.motd, "C");
+    }
+
+    #[test]
+    fn the_broadcast_address_fills_the_host_bits() {
+        let mask = Ipv4Addr::new(255, 255, 255, 0);
+        assert_eq!(
+            broadcast_address(Ipv4Addr::new(192, 168, 43, 1), mask),
+            Ipv4Addr::new(192, 168, 43, 255)
+        );
+        assert_eq!(
+            broadcast_address(Ipv4Addr::new(10, 1, 2, 3), Ipv4Addr::new(255, 255, 0, 0)),
+            Ipv4Addr::new(10, 1, 255, 255)
+        );
+    }
+
+    #[test]
+    fn local_networks_leave_out_loopback() {
+        assert!(local_networks().iter().all(|(ip, _)| !ip.is_loopback()));
     }
 
     #[test]
