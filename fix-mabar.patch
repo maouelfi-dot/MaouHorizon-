@@ -1,0 +1,12 @@
+diff --git a/crates/horizon-client/src/game/network/remote/mod.rs b/crates/horizon-client/src/game/network/remote/mod.rs
+index f2d8e32..0b56aa7 100644
+--- a/crates/horizon-client/src/game/network/remote/mod.rs
++++ b/crates/horizon-client/src/game/network/remote/mod.rs
+@@ -1706,6 +1706,7 @@ impl Game<'_> {
+             listed: Default::default(),
+             online_mode: false,
+             levels: Vec::new(),
++            mabar: None,
+             level_players: HashMap::new(),
+             level_player_names: HashMap::new(),
+             level_player_textures: HashMap::new(),
