@@ -776,6 +776,8 @@ pub(super) struct Remote {
     /// `ClientboundLoginPacket.levels`: the server's level keys, which
     /// `ClientPacketListener.levels()` hands to command suggestions.
     pub(super) levels: Vec<String>,
+    /// Mabar skins while this session is on a LAN (see `own_skin.rs`), dropped with the session.
+    pub(super) mabar: Option<horizon_client::lan::mabar_skins::Mabar>,
     /// Player entities in the level: entity id to profile UUID.
     pub(super) level_players: HashMap<i32, u128>,
     /// The profile name each player entity was created with (`RemotePlayer.getGameProfile`): it outlives the
@@ -1149,6 +1151,10 @@ impl Game<'_> {
     ) -> Result<()> {
         self.realm_session = realm;
         self.reset_tutorial();
+        // Mabar skins: shared with the phones of a LAN, never of the internet.
+        self.set_lan_peer(
+            local.is_none() && horizon_client::lan::mabar_skins::is_private_address(address),
+        );
         self.perf.world_opening();
         // A server's own biomes come over the connection; the last local
         // world's packed table must not name its ids. The window's own
@@ -1439,6 +1445,7 @@ impl Game<'_> {
             listed: Default::default(),
             online_mode: false,
             levels: Vec::new(),
+            mabar: None,
             level_players: HashMap::new(),
             level_player_names: HashMap::new(),
             level_player_textures: HashMap::new(),
@@ -1699,6 +1706,7 @@ impl Game<'_> {
             listed: Default::default(),
             online_mode: false,
             levels: Vec::new(),
+            mabar: None,
             level_players: HashMap::new(),
             level_player_names: HashMap::new(),
             level_player_textures: HashMap::new(),
@@ -6668,8 +6676,22 @@ impl Game<'_> {
             from_elyby.insert(local);
         }
         if !online_mode {
+            let local_name = names
+                .iter()
+                .find(|(u, _)| *u == local)
+                .map(|(_, n)| n.clone());
+            self.mabar_update(local_name.as_deref());
             for (uuid, name) in names {
                 if entries.iter().any(|(u, t)| *u == uuid && t.skin.is_some()) {
+                    continue;
+                }
+                // Mabar: the skin and cape a phone on this LAN announced for its player.
+                if uuid != local
+                    && let Some(textures) = self.mabar_textures(&name)
+                {
+                    entries.retain(|(u, _)| *u != uuid);
+                    entries.push((uuid, textures));
+                    from_elyby.insert(uuid);
                     continue;
                 }
                 if let Some(textures) = self.elyby_textures(&name) {
@@ -13569,937 +13591,7 @@ mod tests {
         mod_api::testing::with_mods(mods, || {
             super::super::native_entity_refs::tests::with_client_game(|game| {
                 let (client, _server) = horizon_protocol::connection::Pipe::pair();
-                game.connect_local(client, "animation-client").unwrap();
-                let remote = game.remote.as_mut().unwrap();
-                remote.entity_id = 42;
-                remote.level_players.insert(66, 789);
-                let kind = remote.player_type.as_ref().unwrap().clone();
-                let mut mob = horizon_client::mobs::Mob::new(
-                    66,
-                    kind,
-                    horizon_core::geometry::Vec3::ZERO,
-                    0.0,
-                );
-                mob.extra.using_item = 1;
-                mob.extra.set_slot_stack(
-                    horizon_items::equipment::MAINHAND,
-                    Some(horizon_client::items::ItemStack::new("minecraft:bow", 1)),
-                );
-                game.mobs.push(mob);
-                game.tick_remote_entities(false);
-                assert_eq!(
-                    game.mobs[0].extra.use_animation,
-                    mod_api::UseAnimation::Drink
-                );
-                assert_eq!(calls.load(Ordering::Relaxed), 1);
-            });
-        });
-    }
-
-    /// After `ClientboundUpdateAttributes`, the local player's `LivingRef`
-    /// reads its attribute value, base, modifiers and attribute list from the
-    /// client's own copy of the synced instances. A mob the server tracks
-    /// keeps no attribute state of its own on the client, so its reads are
-    /// `None` there.
-    #[test]
-    #[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
-    fn update_attributes_answers_the_local_players_living_reads() {
-        use super::super::native_entity_refs::tests::with_client_game;
-        use horizon_client::{mobs::Mob, motion::PlayerMotion};
-        use horizon_core::geometry::Vec3;
-        use horizon_protocol::{
-            buf::Reader,
-            connection::Pipe,
-            packets::play::{self, Clientbound as C},
-        };
-
-        with_client_game(|game| {
-            let (client, _server) = Pipe::pair();
-            game.connect_local(client, "attributes-client").unwrap();
-            let zombie = game
-                .res
-                .mob_types()
-                .get("minecraft:zombie")
-                .unwrap()
-                .clone();
-            game.player = Some(PlayerMotion::new(game.motion, Vec3::ZERO).unwrap());
-            game.player.as_mut().unwrap().entity_id = 42;
-            game.mobs.push(Mob::new(60, zombie, Vec3::ZERO, 0.0));
-            let remote = game.remote.as_mut().unwrap();
-            remote.entity_id = 42;
-            remote.logged_in = true;
-            remote.entities.insert(
-                60,
-                super::Tracked {
-                    kind: "minecraft:zombie".into(),
-                    position: [0.0; 3],
-                    codec_base: [0.0; 3],
-                    silent: false,
-                    vehicle: None,
-                },
-            );
-
-            let health = "minecraft:max_health";
-            let living = game.living(game.entity(42).unwrap()).unwrap();
-            // Before the server says anything, the client's own map holds the
-            // type's defaults, as a vanilla client's does before its sync.
-            assert_eq!(living.attribute_value(game, health), Some(20.0));
-            assert_eq!(living.attribute_modifiers(game, health), Some(Vec::new()));
-
-            let registry_id = game.motion.attributes.id(health).unwrap().registry_id();
-            let packet = C::UpdateAttributes(play::UpdateAttributes {
-                id: 42,
-                values: vec![play::AttributeSnapshot {
-                    attribute: registry_id,
-                    base: 30.0,
-                    modifiers: vec![play::AttributeModifier {
-                        id: "test:bonus".into(),
-                        amount: 5.0,
-                        operation: 0,
-                    }],
-                }],
-            });
-            let body = packet.encode();
-            let mut reader = Reader::new(&body);
-            let id = reader.varint().unwrap();
-            game.handle_packet(C::decode(id, reader.rest()).unwrap())
-                .unwrap();
-
-            assert_eq!(living.attribute_value(game, health), Some(35.0));
-            assert_eq!(living.attribute_base(game, health), Some(30.0));
-            assert_eq!(
-                living.attribute_modifiers(game, health),
-                Some(vec![mod_api::AttributeModifier::new(
-                    mod_api::Identifier::parse("test:bonus").unwrap(),
-                    5.0,
-                    mod_api::AttributeOperation::AddValue,
-                )])
-            );
-            let listed = living.attributes(game).unwrap();
-            assert!(listed.contains(&mod_api::Identifier::parse(health).unwrap()));
-
-            // The mob's attributes are the server's business: no client state,
-            // no read.
-            let mob = mod_api::LivingRef::new(game.entity(60).unwrap());
-            assert_eq!(mob.attribute_value(game, health), None);
-            assert_eq!(mob.attribute_base(game, health), None);
-            assert_eq!(mob.attribute_modifiers(game, health), None);
-            assert_eq!(mob.attributes(game), None);
-        });
-    }
-
-    /// Sleeping metadata and the local tick use the loaded bed's shape, not
-    /// a red-bed constant. Missing client data must not replace a server pose
-    /// or decide to wake the player.
-    #[test]
-    #[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
-    fn client_sleep_metadata_and_tick_preserve_shape_and_authoritative_positions() {
-        use super::super::{execution_role::ExecutionRole, native_entity_refs::tests::with_game};
-        use horizon_client::{chunk::Chunk, mobs::Mob, motion::PlayerMotion};
-        use horizon_core::geometry::Vec3;
-        use horizon_protocol::{
-            buf::Reader,
-            connection::Pipe,
-            entity_data::{Value, serializer},
-            packets::play::{self, Clientbound as C},
-        };
-
-        let deliver = |game: &mut super::super::Game<'_>, packet: C| {
-            let body = packet.encode();
-            let mut reader = Reader::new(&body);
-            let id = reader.varint().unwrap();
-            game.handle_packet(C::decode(id, reader.rest()).unwrap())
-                .unwrap();
-        };
-        let metadata = |id, bed: Option<[i32; 3]>| {
-            C::SetEntityData(play::SetEntityData {
-                id,
-                values: vec![
-                    (
-                        6,
-                        serializer::POSE,
-                        Value::Id(if bed.is_some() { 2 } else { 0 }),
-                    ),
-                    (14, serializer::OPTIONAL_BLOCK_POS, Value::OptPos(bed)),
-                ],
-            })
-        };
-        let teleport = |position: Vec3| {
-            C::PlayerPosition(play::PlayerPosition {
-                teleport: 1,
-                position: [position.x, position.y, position.z],
-                delta: [0.0; 3],
-                yaw: 0.0,
-                pitch: 30.0,
-                relatives: 0,
-            })
-        };
-
-        with_game(|game| {
-            game.options.execution_role = ExecutionRole::Client;
-            let (client, server) = Pipe::pair();
-            game.connect_local(client, "sleep-client").unwrap();
-            let remote = game.remote.as_mut().unwrap();
-            remote.logged_in = true;
-            remote.loaded_sent = true;
-            remote.entity_id = 42;
-            remote.level_players.insert(66, 789);
-            let kind = remote.player_type.as_ref().unwrap().clone();
-            let authoritative = Vec3::new(8.5, 70.0, 8.5);
-            game.player = Some(PlayerMotion::new(game.motion, authoritative).unwrap());
-            game.mobs.push(Mob::new(66, kind, authoritative, 0.0));
-            game.streaming
-                .insert_remote(&mut game.world, Chunk::empty(0, 0));
-            let registry = game.pack.assets.registry;
-            let air = registry.default_state("minecraft:air").unwrap();
-            let stone = registry.default_state("minecraft:stone").unwrap();
-
-            // Straw's foot is 4/16 high; red's shape is 9/16. These expected
-            // positions are independent of sleeping_position and its helpers.
-            for (name, complete, head, expected) in [
-                (
-                    "minecraft:straw_bed",
-                    true,
-                    [5, 64, 5],
-                    Some(Vec3::new(5.5, 64.375, 5.5)),
-                ),
-                (
-                    "minecraft:red_bed",
-                    true,
-                    [5, 64, 5],
-                    Some(Vec3::new(5.5, 64.6875, 5.5)),
-                ),
-                ("minecraft:straw_bed", false, [5, 64, 5], None),
-                ("minecraft:stone", false, [5, 64, 5], None),
-                ("minecraft:straw_bed", false, [37, 64, 5], None),
-            ] {
-                let case = (name, complete, head);
-                game.world.set(5, 64, 5, air).unwrap();
-                game.world.set(5, 64, 6, air).unwrap();
-                if head[0] == 5 {
-                    let state = if name == "minecraft:stone" {
-                        stone
-                    } else {
-                        registry
-                            .resolve(&horizon_world::chunk::BlockState {
-                                name: name.into(),
-                                properties: [
-                                    ("facing", "north"),
-                                    ("occupied", "false"),
-                                    ("part", "head"),
-                                ]
-                                .into_iter()
-                                .map(|(k, v)| (k.into(), v.into()))
-                                .collect(),
-                            })
-                            .unwrap()
-                    };
-                    game.world.set(5, 64, 5, state).unwrap();
-                    if complete {
-                        let mut foot = registry.state(state).unwrap().clone();
-                        foot.properties.insert("part".into(), "foot".into());
-                        game.world
-                            .set(5, 64, 6, registry.id(&foot).unwrap())
-                            .unwrap();
-                    }
-                } else {
-                    assert!(!game.world.chunks.contains_key(&(2, 0)));
-                }
-                deliver(game, teleport(authoritative));
-                let other = game.mob_index.get_mut(&mut game.mobs, 66).unwrap();
-                other.position = authoritative;
-                other.previous = authoritative;
-                other.head_pitch = 30.0;
-                other.previous_head_pitch = 30.0;
-                game.sleep_timer = 17;
-                deliver(game, metadata(66, Some(head)));
-                deliver(game, metadata(42, Some(head)));
-                let at = expected.unwrap_or(authoritative);
-                assert_eq!(
-                    game.player.as_ref().unwrap().position,
-                    at,
-                    "own metadata: {case:?}"
-                );
-                assert_eq!(game.previous_position, at, "own old position: {case:?}");
-                let other = game.mob_index.get(&game.mobs, 66).unwrap();
-                assert_eq!(other.position, at, "other metadata: {case:?}");
-                assert_eq!(other.previous, at, "other old position: {case:?}");
-                assert_eq!((other.head_pitch, other.previous_head_pitch), (0.0, 0.0));
-                assert_eq!(game.sleeping, Some(head));
-                assert_eq!(game.sleep_timer, 0);
-
-                // A correct authoritative teleport cannot be overwritten by
-                // the next sleeping tick, even while this client's bed is absent.
-                deliver(game, teleport(at));
-                game.player.as_mut().unwrap().velocity = Vec3::new(0.3, -0.4, 0.2);
-                for timer in 1..=2 {
-                    game.tick_remote_player(true, false).unwrap();
-                    assert_eq!(game.sleep_timer, timer, "local tick must execute: {case:?}");
-                    assert_eq!(game.sleeping, Some(head));
-                    let player = game.player.as_ref().unwrap();
-                    assert_eq!(player.position, at, "own tick: {case:?}");
-                    assert_eq!(player.velocity, Vec3::ZERO);
-                    assert_eq!(player.pitch, 0.0);
-                    assert_eq!(
-                        game.mob_index.get(&game.mobs, 66).unwrap().position,
-                        at,
-                        "other tick: {case:?}"
-                    );
-                }
-
-                deliver(game, metadata(66, None));
-                deliver(game, metadata(42, None));
-                assert_eq!(game.sleeping, None);
-                assert_eq!(
-                    game.player.as_ref().unwrap().position,
-                    at,
-                    "clearing metadata does not relocate"
-                );
-                let other = game.mob_index.get(&game.mobs, 66).unwrap();
-                assert_eq!(other.position, at);
-                assert_eq!(other.extra.ints[1], 0);
-                assert_eq!(other.extra.synced_pose, 0);
-                deliver(game, C::Animate(play::Animate { id: 42, action: 0 }));
-                assert_eq!(game.sleep_timer, 100);
-                let wake = Vec3::new(9.5, 70.1, 9.5);
-                deliver(game, teleport(wake));
-                assert_eq!(game.player.as_ref().unwrap().position, wake);
-                game.tick_remote_player(true, false).unwrap();
-                assert_eq!(game.sleeping, None);
-                assert_eq!(game.sleep_timer, 101);
-                let player = game.player.as_ref().unwrap();
-                assert_eq!(
-                    (player.position.x, player.position.z),
-                    (wake.x, wake.z),
-                    "wake tick must not snap to bed: {case:?}"
-                );
-            }
-            server.shutdown();
-        });
-    }
-
-    /// `ClientChatReceivedEvent`: a mod's replacement is the line the chat
-    /// shows, a cancelled system line never shows, and a cancelled message
-    /// held by Chat Delay lets the next one through in the same tick.
-    #[test]
-    #[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
-    fn mods_replace_and_cancel_received_chat() {
-        use super::super::{execution_role::ExecutionRole, native_entity_refs::tests::with_game};
-        use horizon_core::nbt::Tag;
-        use horizon_protocol::{
-            connection::Pipe,
-            packets::play::{self, Clientbound as C},
-        };
-
-        struct Censor;
-        #[mod_api::__subscriptions]
-        impl mod_api::Hooks for Censor {
-            fn client_chat_received(
-                &self,
-                _: &mut dyn mod_api::ClientHost,
-                event: &mut mod_api::ClientChatReceivedEvent<'_>,
-            ) -> mod_api::Flow {
-                use mod_api::text::TextContent;
-                let text = match &event.message.content {
-                    TextContent::Literal(text) => text,
-                    // Player chat arrives decorated with the sender and message.
-                    TextContent::Translatable { key, arguments, .. } if key == "chat.type.text" => {
-                        let TextContent::Literal(text) = &arguments[1].content else {
-                            panic!("expected literal player message fixture");
-                        };
-                        text
-                    }
-                    _ => return mod_api::Flow::Continue,
-                };
-                if text.contains("drop") {
-                    return mod_api::Flow::Cancel;
-                }
-                if event.system {
-                    *event.message = mod_api::Text::literal(format!("[server] {text}"));
-                }
-                mod_api::Flow::Continue
-            }
-        }
-        mod_api::__private::install(std::sync::Arc::from([mod_api::ModEntry::new(
-            "test-chat-received",
-            Box::new(Censor),
-        )]));
-
-        with_game(|game| {
-            game.options.execution_role = ExecutionRole::Client;
-            let (client, _server) = Pipe::pair();
-            game.connect_local(client, "ChatTest").unwrap();
-            let lines = |game: &super::super::Game| -> Vec<String> {
-                let chat = &game.remote.as_ref().unwrap().chat;
-                chat.iter().map(|(line, _)| line.clone()).collect()
-            };
-            let system = |content: &str| {
-                C::SystemChat(play::SystemChat {
-                    content: Tag::String(content.into()),
-                    overlay: false,
-                })
-            };
-            game.handle_packet(system("hello")).unwrap();
-            game.handle_packet(system("drop me")).unwrap();
-            assert_eq!(lines(game), ["[server] hello"]);
-
-            game.settings.chat_delay = 1.0;
-            let disguised = |message: &str| {
-                C::DisguisedChat(play::DisguisedChat {
-                    message: Tag::String(message.into()),
-                    chat_type: play::ChatTypeBound {
-                        chat_type: 0,
-                        name: Tag::String("Steve".into()),
-                        target: None,
-                    },
-                })
-            };
-            game.handle_packet(disguised("drop this")).unwrap();
-            game.handle_packet(disguised("hi")).unwrap();
-            assert_eq!(lines(game).len(), 1, "Chat Delay holds both");
-            game.tick_chat_queue();
-            let shown = lines(game);
-            assert_eq!(shown.len(), 2, "{shown:?}");
-            assert!(
-                shown[1].contains("hi") && !shown[1].contains("drop"),
-                "{shown:?}"
-            );
-        });
-    }
-
-    #[test]
-    #[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
-    fn mod_chat_needs_a_joined_player_and_what_the_chat_option_allows() {
-        use super::super::{execution_role::ExecutionRole, native_entity_refs::tests::with_game};
-        use horizon_protocol::connection::Pipe;
-
-        with_game(|game| {
-            game.options.execution_role = ExecutionRole::Client;
-            assert!(mod_api::prelude::NetworkClientHost::send_chat(game, "/warp spawn").is_err());
-            let (client, _server) = Pipe::pair();
-            game.connect_local(client, "ChatTest").unwrap();
-            assert!(mod_api::prelude::NetworkClientHost::send_chat(game, "/warp spawn").is_err());
-            game.remote.as_mut().unwrap().joined = true;
-            assert!(mod_api::prelude::NetworkClientHost::send_chat(game, "  ").is_err());
-            // Full, then Commands Only, then Hidden.
-            game.settings.chat_visibility = 0;
-            assert!(mod_api::prelude::NetworkClientHost::send_chat(game, "hello").is_ok());
-            assert!(mod_api::prelude::NetworkClientHost::send_chat(game, "/warp spawn").is_ok());
-            game.settings.chat_visibility = 1;
-            assert!(mod_api::prelude::NetworkClientHost::send_chat(game, "hello").is_err());
-            assert!(mod_api::prelude::NetworkClientHost::send_chat(game, "/warp spawn").is_ok());
-            game.settings.chat_visibility = 2;
-            assert!(mod_api::prelude::NetworkClientHost::send_chat(game, "/warp spawn").is_err());
-        });
-    }
-
-    /// `ChatComponent.addClientSystemMessage`: the line joins this client's
-    /// chat history and no packet leaves for the server.
-    #[test]
-    #[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
-    fn a_mod_chat_line_shows_locally_and_sends_nothing() {
-        use super::super::{execution_role::ExecutionRole, native_entity_refs::tests::with_game};
-        use horizon_protocol::connection::{Connection, Pipe};
-
-        with_game(|game| {
-            game.options.execution_role = ExecutionRole::Client;
-            let (client, server) = Pipe::pair();
-            game.connect_local(client, "ChatLineTest").unwrap();
-            // Whatever connecting wrote is not this line's; drain it until the
-            // client waits for the login answer, so the check below is about
-            // `chat_line` alone.
-            let (mut reader, _writer) = Connection::local(server).split();
-            reader
-                .set_read_timeout(Some(std::time::Duration::from_secs(1)))
-                .unwrap();
-            while reader.recv().is_ok() {}
-            mod_api::prelude::NetworkClientHost::chat_line(
-                game,
-                mod_api::Text::literal("local only"),
-            )
-            .unwrap();
-            let history: Vec<_> = game
-                .remote
-                .as_ref()
-                .unwrap()
-                .chat
-                .iter()
-                .map(|(line, _)| line.clone())
-                .collect();
-            assert_eq!(history, ["local only"]);
-            assert!(
-                reader.recv().unwrap_err().is_timed_out(),
-                "a local chat line sends nothing to the server"
-            );
-        });
-    }
-
-    #[test]
-    #[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
-    fn rejected_menu_packets_retire_the_previous_client_menu() {
-        use super::super::{
-            Screen, execution_role::ExecutionRole, native_entity_refs::tests::with_game,
-        };
-        use horizon_client::items::ItemStack;
-        use horizon_core::nbt::Tag;
-        use horizon_protocol::{
-            connection::Pipe,
-            packets::play::{Clientbound as C, MountScreenOpen, OpenScreen},
-        };
-
-        with_game(|game| {
-            game.options.execution_role = ExecutionRole::Client;
-            let (client, _server) = Pipe::pair();
-            game.connect_local(client, "MenuTest").unwrap();
-            for packet in [
-                C::OpenScreen(OpenScreen {
-                    container: 7,
-                    menu: -1,
-                    title: Tag::String("unsupported".into()),
-                }),
-                C::MountScreenOpen(MountScreenOpen {
-                    container: 7,
-                    columns: 0,
-                    entity: i32::MAX,
-                }),
-            ] {
-                let remote = game.remote.as_mut().unwrap();
-                remote.menu.set(Some((7, "minecraft:generic_9x3".into())));
-                let generation = remote.menu.generation;
-                game.set_screen(Screen::Inventory);
-                game.carried = Some(ItemStack::new("minecraft:stone", 1));
-                game.handle_packet(packet).unwrap();
-                let remote = game.remote.as_ref().unwrap();
-                assert!(remote.menu.as_ref().is_none());
-                assert_ne!(remote.menu.generation, generation);
-                assert!(game.carried.is_none());
-                assert!(game.screen == Screen::Playing);
-            }
-        });
-    }
-
-    /// `LivingEntity.handleEntityEvent(55)` is `swapHandItems`: the whole
-    /// stacks trade hands, not just their ids.
-    #[test]
-    #[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
-    fn the_hand_swap_event_keeps_whole_stacks() {
-        use super::super::native_entity_refs::tests::with_game;
-        use horizon_client::{items::ItemStack, mobs::Mob};
-        use horizon_core::geometry::Vec3;
-        use horizon_items::equipment::{MAINHAND, OFFHAND};
-        use horizon_protocol::packets::play::{Clientbound as C, EntityEvent};
-
-        with_game(|game| {
-            let kind = game
-                .res
-                .mob_types()
-                .get("minecraft:zombie")
-                .unwrap()
-                .clone();
-            let mut sword = ItemStack::new("minecraft:diamond_sword", 1);
-            sword.damage = 40;
-            sword.data_mut().custom_name = Some(horizon_core::nbt::Tag::String("Biter".into()));
-            let mut shield = ItemStack::new("minecraft:shield", 1);
-            shield.damage = 12;
-            let mut mob = Mob::new(31, kind, Vec3::new(0.5, 64.0, 0.5), 0.0);
-            mob.extra.set_slot_stack(MAINHAND, Some(sword.clone()));
-            mob.extra.set_slot_stack(OFFHAND, Some(shield.clone()));
-            game.mobs.push(mob);
-            let swap = |game: &mut super::super::Game| {
-                game.handle_packet(C::EntityEvent(EntityEvent { id: 31, event: 55 }))
-                    .unwrap();
-            };
-            swap(game);
-            let m = game.mobs.iter().find(|m| m.id == 31).unwrap();
-            assert_eq!(m.extra.slot_stack(MAINHAND), Some(&shield));
-            assert_eq!(m.extra.slot_stack(OFFHAND), Some(&sword));
-            swap(game);
-            let m = game.mobs.iter().find(|m| m.id == 31).unwrap();
-            assert_eq!(m.extra.slot_stack(MAINHAND), Some(&sword));
-            assert_eq!(m.extra.slot_stack(OFFHAND), Some(&shield));
-        });
-    }
-
-    #[test]
-    fn client_menu_generation_changes_on_reused_window_ids() {
-        let mut menu = super::ClientMenu::default();
-        let inventory = menu.generation;
-        menu.set(Some((7, "minecraft:generic_9x3".to_owned())));
-        let first = menu.generation;
-        assert_ne!(inventory, first);
-        menu.set(None);
-        let closed = menu.generation;
-        assert_ne!(first, closed);
-        assert!(menu.as_ref().is_none());
-        menu.set(Some((7, "minecraft:generic_9x3".to_owned())));
-        assert_ne!(closed, menu.generation);
-        assert_ne!(first, menu.generation);
-        assert_eq!(menu.as_ref().map(|entry| entry.0), Some(7));
-        let before_replacement = menu.generation;
-        menu.set(Some((7, "minecraft:generic_9x3".to_owned())));
-        assert_ne!(before_replacement, menu.generation);
-    }
-
-    #[test]
-    fn client_menu_slot_mapping_covers_inventory_and_containers() {
-        for (name, count, first, last) in [
-            ("inventory", 46, 200, 504),
-            ("minecraft:crafting", 46, 200, 8),
-            ("minecraft:generic_9x3", 63, 300, 8),
-            ("minecraft:hopper", 41, 300, 8),
-            ("minecraft:furnace", 39, 300, 8),
-            ("minecraft:brewing_stand", 41, 300, 8),
-        ] {
-            assert_eq!(super::Game::inventory_screen_slot(name, 0), Some(first));
-            assert_eq!(
-                super::Game::inventory_screen_slot(name, count - 1),
-                Some(last)
-            );
-            assert_eq!(super::Game::inventory_screen_slot(name, count), None);
-        }
-        assert_eq!(
-            super::Game::inventory_screen_slot("minecraft:unknown", 0),
-            None
-        );
-    }
-
-    #[test]
-    #[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
-    fn transactional_bucket_hands_reach_the_owning_client() {
-        use super::super::{
-            native_entity_refs::tests::with_client_game, native_guest_turn_tests::with_guests,
-        };
-        use horizon_client::{
-            items::ItemStack,
-            lan::{Out, PlayerSender},
-        };
-        use horizon_protocol::{buf::Reader, packets::play::Clientbound as C};
-        use mod_api::{HostTransaction, ITEM_FLUIDS, ItemPlace, ServerHost, move_resources};
-
-        with_guests(|server| {
-            let (tx, rx) = std::sync::mpsc::channel();
-            server.lan.as_mut().unwrap().hub.guests.update(0, |guest| {
-                guest.sender = PlayerSender::new(tx, std::sync::Arc::default());
-                guest.selected = 2;
-                guest.inventory[2] = Some(ItemStack::new("minecraft:bucket", 1));
-                guest.offhand = Some(ItemStack::new("minecraft:water_bucket", 1));
-            });
-            let main = ItemPlace::PlayerHand {
-                player: 12,
-                hand: horizon_client::first_person::Hand::Main,
-            };
-            let off = ItemPlace::PlayerHand {
-                player: 12,
-                hand: horizon_client::first_person::Hand::Off,
-            };
-            with_client_game(|client| {
-                let (_reader, _writer) = connect_menu_test(client);
-                spawn_menu_test(client);
-                client.selected = 2;
-                // Consume actual server packets through the client's ordinary handler.
-                let deliver = |client: &mut super::Game<'_>| {
-                    let mut slots = Vec::new();
-                    for out in rx.try_iter() {
-                        let bodies = match out {
-                            Out::Packet(body) => vec![body],
-                            Out::Packets(bodies) => bodies,
-                            Out::Disconnect(_) => panic!("owner disconnected"),
-                        };
-                        for body in bodies {
-                            let mut reader = Reader::new(&body);
-                            let id = reader.varint().unwrap();
-                            let packet = C::decode(id, reader.rest()).unwrap();
-                            // Other tick packets concern entity/chunk state, not this contract.
-                            if let C::ContainerSetSlot(ref slot) = packet {
-                                slots.push(slot.slot);
-                                client.handle_packet(packet).unwrap();
-                            }
-                        }
-                    }
-                    slots
-                };
-                server.tick_lan(true);
-                deliver(client);
-                assert_eq!(
-                    client.inventory[2],
-                    Some(ItemStack::new("minecraft:bucket", 1))
-                );
-                assert_eq!(
-                    client.offhand,
-                    Some(ItemStack::new("minecraft:water_bucket", 1))
-                );
-
-                for commit in [false, true] {
-                    let host: &mut dyn ServerHost = server;
-                    let result = host.transaction(|host, tx| {
-                        let source = off.capability(host, &ITEM_FLUIDS).unwrap();
-                        let target = main.capability(host, &ITEM_FLUIDS).unwrap();
-                        assert_eq!(
-                            move_resources(host, &source, &target, |_| true, 1000, tx).unwrap(),
-                            1000
-                        );
-                        if commit { Ok(()) } else { Err(()) }
-                    });
-                    assert_eq!(result.is_ok(), commit);
-                    server.tick_lan(true);
-                    let slots = deliver(client);
-                    if commit {
-                        assert!(slots.contains(&38), "selected hotbar slot published");
-                        assert!(slots.contains(&45), "offhand published");
-                    } else {
-                        assert!(slots.is_empty(), "abort publishes no tentative inventory");
-                    }
-                    let (held, other) = if commit {
-                        ("minecraft:water_bucket", "minecraft:bucket")
-                    } else {
-                        ("minecraft:bucket", "minecraft:water_bucket")
-                    };
-                    assert_eq!(
-                        client.inventory[client.selected],
-                        Some(ItemStack::new(held, 1))
-                    );
-                    assert_eq!(client.offhand, Some(ItemStack::new(other, 1)));
-                    let guest = &server.lan.as_ref().unwrap().hub.guests[0];
-                    assert_eq!(guest.inventory[2], client.inventory[2]);
-                    assert_eq!(guest.offhand, client.offhand);
-                }
-                server.tick_lan(true);
-                assert!(
-                    deliver(client).is_empty(),
-                    "settled slots are not sent twice"
-                );
-            });
-        });
-    }
-
-    /// A client connecting through a local pipe and through configuration, as
-    /// the client menu tests drive it: the server end's reader (what the
-    /// client sends) and writer.
-    fn connect_menu_test(
-        game: &mut super::Game<'_>,
-    ) -> (
-        horizon_protocol::connection::ConnReader,
-        horizon_protocol::connection::ConnWriter,
-    ) {
-        use super::super::execution_role::ExecutionRole;
-        use horizon_protocol::{
-            connection::{Connection, Pipe},
-            packets::{Empty, configuration as cfg, login},
-        };
-        game.options.execution_role = ExecutionRole::Client;
-        let (client, server) = Pipe::pair();
-        game.connect_local(client, "MenuReadTest").unwrap();
-        let (mut reader, mut writer) = Connection::local(server).split();
-        reader
-            .set_read_timeout(Some(std::time::Duration::from_secs(5)))
-            .unwrap();
-        reader.recv().unwrap();
-        reader.recv().unwrap();
-        writer
-            .send(
-                &login::Clientbound::LoginFinished(login::LoginFinished {
-                    profile: login::GameProfile {
-                        uuid: 42,
-                        name: "MenuReadTest".into(),
-                        properties: vec![],
-                    },
-                    session: 1,
-                })
-                .encode(),
-            )
-            .unwrap();
-        let (id, body) = reader.recv().unwrap();
-        assert!(matches!(
-            login::Serverbound::decode(id, &body).unwrap(),
-            login::Serverbound::LoginAcknowledged(_)
-        ));
-        reader.recv().unwrap();
-        reader.recv().unwrap();
-        writer
-            .send(&cfg::Clientbound::FinishConfiguration(Empty).encode())
-            .unwrap();
-        let (id, body) = reader.recv().unwrap();
-        assert!(matches!(
-            cfg::Serverbound::decode(id, &body).unwrap(),
-            cfg::Serverbound::FinishConfiguration(_)
-        ));
-        (reader, writer)
-    }
-
-    #[test]
-    #[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
-    fn dimension_transition_screen_is_selected_at_entry_drawn_and_dropped() {
-        use super::super::{execution_role::ExecutionRole, native_entity_refs::tests::with_game};
-        use horizon_client::{hud::HudBatch, level_loading::Reason};
-        use mod_api::__private::game::RegistrationContextNew;
-        use mod_api::{DimensionTransition, DimensionTransitionScreen};
-
-        struct Arrival;
-        #[mod_api::__subscriptions]
-        impl mod_api::Hooks for Arrival {
-            fn register_dimension_transition_screen(
-                &self,
-                _: &mod_api::RegistrationContext,
-                event: &mut mod_api::RegisterDimensionTransitionScreenEvent<'_>,
-            ) {
-                event.screens.push(DimensionTransitionScreen {
-                    screen: "transition_test:arrival".into(),
-                    transition: DimensionTransition::Conditional {
-                        to: "transition_test:b".into(),
-                        from: "transition_test:a".into(),
-                    },
-                });
-            }
-            fn dimension_transition_screen_draw(
-                &self,
-                _: &dyn mod_api::ClientHost,
-                event: &mut mod_api::DimensionTransitionScreenDrawEvent<'_>,
-            ) {
-                assert_eq!(event.screen, "transition_test:arrival");
-                assert_eq!(event.reason, mod_api::DimensionTransitionReason::Other);
-                assert_eq!(event.progress, Some(0.25));
-                event.draw.fill([0.0, 0.0, 80.0, 10.0], 0xFF102030);
-            }
-        }
-        mod_api::testing::with_mods(
-            vec![mod_api::ModEntry::new("transition_test", Box::new(Arrival))].into(),
-            || {
-                let mut registrations = Vec::new();
-                super::Game::native_register_dimension_transition_screen(
-                    &mod_api::RegistrationContext::new(),
-                    &mut registrations,
-                );
-                horizon_client_render::dimension_transition::register(registrations);
-                with_game(|game| {
-                    game.options.execution_role = ExecutionRole::Client;
-                    let (client, _server) = horizon_protocol::connection::Pipe::pair();
-                    game.connect_local(client, "TransitionTest").unwrap();
-                    let mut spawn = horizon_protocol::packets::play::SpawnInfo {
-                        dimension_type: 0,
-                        dimension: "transition_test:a".into(),
-                        seed: 0,
-                        game_type: 0,
-                        previous_game_type: None,
-                        debug: false,
-                        flat: true,
-                        last_death: None,
-                        portal_cooldown: 0,
-                        sea_level: 63,
-                    };
-                    game.enter_remote_dimension(&spawn, false, Reason::Other);
-                    assert_eq!(
-                        game.remote.as_ref().unwrap().level_load.transition_screen(),
-                        None
-                    );
-                    spawn.dimension = "transition_test:b".into();
-                    game.enter_remote_dimension(&spawn, true, Reason::Other);
-                    let tracker = game.remote.as_ref().unwrap().level_load;
-                    assert!(tracker.transition_screen().is_some());
-                    let mut batch = HudBatch::scratch([320, 240]);
-                    assert!(game.draw_dimension_transition_screen(
-                        &mut batch,
-                        &tracker,
-                        Some(0.25)
-                    ));
-                    assert!(!batch.vertices.is_empty());
-                    game.remote.as_mut().unwrap().level_load.finish();
-                    let tracker = game.remote.as_ref().unwrap().level_load;
-                    assert!(!game.draw_dimension_transition_screen(&mut batch, &tracker, None));
-                    spawn.dimension = "transition_test:c".into();
-                    game.enter_remote_dimension(&spawn, true, Reason::Other);
-                    let tracker = game.remote.as_ref().unwrap().level_load;
-                    let mut vanilla = HudBatch::scratch([320, 240]);
-                    assert!(!game.draw_dimension_transition_screen(&mut vanilla, &tracker, None));
-                    game.draw_level_loading_background(&mut vanilla, tracker.reason);
-                    assert!(!vanilla.vertices.is_empty());
-                });
-            },
-        );
-    }
-
-    /// Spawns the connected client in the overworld as entity 7, profile 42.
-    fn spawn_menu_test(game: &mut super::Game<'_>) -> horizon_protocol::packets::play::SpawnInfo {
-        use horizon_client::level_loading::Reason;
-        use horizon_protocol::packets::play::SpawnInfo;
-        let spawn = SpawnInfo {
-            dimension_type: 0,
-            dimension: "minecraft:overworld".into(),
-            seed: 0,
-            game_type: 0,
-            previous_game_type: None,
-            debug: false,
-            flat: true,
-            last_death: None,
-            portal_cooldown: 0,
-            sea_level: 63,
-        };
-        game.enter_remote_dimension(&spawn, false, Reason::Other);
-        let remote = game.remote.as_mut().unwrap();
-        remote.logged_in = true;
-        remote.entity_id = 7;
-        remote.profile = 42;
-        spawn
-    }
-
-    #[test]
-    #[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
-    fn client_menu_reads_follow_packets_and_lifetimes() {
-        use super::super::{
-            Screen, execution_role::ExecutionRole, native_entity_refs::tests::with_game,
-        };
-        use horizon_client::level_loading::Reason;
-        use horizon_core::nbt::Tag;
-        use horizon_protocol::{
-            connection::Pipe,
-            item::Stack,
-            packets::play::{self, Clientbound as C},
-        };
-
-        with_game(|game| {
-            let (mut reader, _writer) = connect_menu_test(game);
-            assert!(
-                game.local_player()
-                    .and_then(|player| game.player_container_menu(player))
-                    .is_none()
-            );
-            let spawn = spawn_menu_test(game);
-            let menu = game
-                .local_player()
-                .and_then(|player| game.player_container_menu(player))
-                .unwrap();
-            assert_eq!(game.menu_slot_count(menu), Some(46));
-            assert_eq!(game.menu_slot(menu, 46), None);
-            assert_eq!(game.menu_slot(menu, 36), Some(None));
-            let stone = Some(Stack::new(game.item_id("minecraft:stone"), 3));
-            game.handle_packet(C::SetPlayerInventory(play::SetPlayerInventory {
-                slot: 0,
-                item: stone.clone(),
-            }))
-            .unwrap();
-            assert_eq!(game.menu_slot(menu, 36).unwrap().unwrap().count, 3);
-            use mod_api::{DragKind, MenuClick, MouseButton, SwapWith};
-            let pickup = |slot| MenuClick::Pickup {
-                slot: Some(slot),
-                button: MouseButton::Left,
-            };
-            for invalid in [
-                pickup(46),
-                pickup(usize::MAX),
-                MenuClick::Swap {
-                    slot: 36,
-                    with: SwapWith::Hotbar(9),
-                },
-                MenuClick::Clone { slot: 36 },
-                MenuClick::Drag {
-                    kind: DragKind::Clone,
-                    slots: vec![36],
-                },
-                MenuClick::Drag {
-                    kind: DragKind::Split,
-                    slots: vec![36, usize::MAX],
-                },
-            ] {
-                assert!(!menu.click(game, &[invalid]));
+     !(!menu.click(game, &[invalid]));
                 assert_eq!(menu.slot(game, 36).unwrap().unwrap().count(), 3);
                 assert_eq!(menu.carried(game), Some(None));
             }
@@ -15893,2057 +14985,1631 @@ mod tests {
             }
             // A same-position resend replaces the data without removing the column.
             game.streaming
-                .replace_remote(&mut game.world, Chunk::empty(0, 0));
-            assert_eq!(game.world.chunks.len(), 2);
-            assert!(game.world.chunks.contains_key(&(0, 0)));
-            assert!(game.streaming.is_lit(0, 0));
-            let mut forgotten = [(0, 0)].into_iter().collect();
-            game.forget_remote_columns(&mut forgotten, true);
-            assert!(!game.world.chunks.contains_key(&(0, 0)));
-            assert!(!game.world.block_entities.contains_key(&(0, 64, 0)));
-            assert!(!game.streaming.is_lit(0, 0));
-            assert!(game.world.chunks.contains_key(&(1, 0)));
-            game.forget_remote_columns(&mut [(0, 0)].into_iter().collect(), true);
-            for x in [7, 13] {
-                game.streaming
-                    .insert_remote(&mut game.world, Chunk::empty(x, 0));
-                game.world
-                    .block_entities
-                    .insert((x * 16, 64, 0), BlockEntity::Chest(vec![]));
-            }
-            // Cache-centre packet: move to (15, 0), at radius 10.
-            game.drop_remote_chunks_out_of_range((15, 0), 10);
-            assert!(!game.world.chunks.contains_key(&(1, 0)));
-            assert!(game.world.chunks.contains_key(&(7, 0)));
-            assert!(game.world.chunks.contains_key(&(13, 0)));
-            // Cache-radius packet: shrinking to 2 keeps radius 5 around (15, 0).
-            game.drop_remote_chunks_out_of_range((15, 0), 2);
-            assert!(!game.world.chunks.contains_key(&(7, 0)));
-            assert!(game.world.chunks.contains_key(&(13, 0)));
-            assert!(!game.world.block_entities.contains_key(&(7 * 16, 64, 0)));
-            // A later forget for an evicted column is harmless.
-            game.forget_remote_columns(&mut [(7, 0)].into_iter().collect(), true);
-            game.forget_all_remote_columns();
-            assert!(game.world.chunks.is_empty());
-            assert!(game.world.block_entities.is_empty());
-        });
-    }
-
-    /// The client chunk seam (game/network/remote_chunks.rs) across every free
-    /// route, as the freed set each route returns: a forget packet, the
-    /// eager centre-move drop (a cache-centre packet), the radius-shrink
-    /// drop (a cache-radius packet) and the client level going. One freed
-    /// entry per column, in the order the routes free them, and a repeat
-    /// forget for an already-freed column frees nothing: adopting a column
-    /// is a chunk packet's doing (`remote_chunk`), not the streaming
-    /// level's.
-    #[test]
-    #[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
-    fn every_free_route_returns_the_columns_it_freed_once() {
-        use super::super::native_entity_refs::tests::with_game;
-        use horizon_client::chunk::Chunk;
-
-        with_game(|game| {
-            for x in [0, 1] {
-                game.streaming
-                    .insert_remote(&mut game.world, Chunk::empty(x, 0));
-            }
-            // A forget packet frees its column once; the same forget again,
-            // for a column already freed, frees nothing.
-            let mut gone = [(0, 0)].into_iter().collect();
-            assert_eq!(game.forget_remote_columns(&mut gone, true), [(0, 0)]);
-            let mut gone = [(0, 0)].into_iter().collect();
-            assert!(game.forget_remote_columns(&mut gone, true).is_empty());
-            for x in [7, 13] {
-                game.streaming
-                    .insert_remote(&mut game.world, Chunk::empty(x, 0));
-            }
-            // The centre move to (15, 0) at radius 10 frees (1, 0) only.
-            assert_eq!(game.drop_remote_chunks_out_of_range((15, 0), 10), [(1, 0)]);
-            // Shrinking the radius to 2 frees (7, 0) only.
-            assert_eq!(game.drop_remote_chunks_out_of_range((15, 0), 2), [(7, 0)]);
-            // The client level going frees what is left.
-            assert_eq!(game.forget_all_remote_columns(), [(13, 0)]);
-            assert!(game.world.chunks.is_empty());
-            assert!(game.world.block_entities.is_empty());
-        });
-    }
-
-    /// The seam sits at the packet level: streaming adopting, replacing or
-    /// re-sending a column keeps it resident â€” a re-sent position loads
-    /// again (`remote_chunk`), never an unload and a load â€” so a forget
-    /// returns exactly it.
-    #[test]
-    #[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
-    fn streaming_adoption_and_resend_stay_resident_until_the_forget() {
-        use super::super::native_entity_refs::tests::with_game;
-        use horizon_client::chunk::Chunk;
-
-        with_game(|game| {
-            game.streaming
-                .insert_remote(&mut game.world, Chunk::empty(0, 0));
-            // A re-send of a resident, lit column takes replace_remote.
-            game.streaming
-                .replace_remote(&mut game.world, Chunk::empty(0, 0));
-            assert!(game.world.chunks.contains_key(&(0, 0)));
-            let mut gone = [(0, 0)].into_iter().collect();
-            assert_eq!(game.forget_remote_columns(&mut gone, true), [(0, 0)]);
-        });
-    }
-
-    #[test]
-    #[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
-    fn joining_a_server_empties_the_off_hand_too() {
-        // ClientPacketListener.handleLogin makes a new LocalPlayer, whose whole Inventory is
-        // empty: a server that never sends slot 45 must not leave the last server's item.
-        use crate::game::{
-            Audio, Game, Options, Progress, Settings, execution_role::ExecutionRole, load_resources,
-        };
-        use horizon_client::items::ItemStack;
-        let root = std::path::PathBuf::from(std::env::var_os("HORIZON_TEST_RESOURCES").unwrap());
-        let settings = Settings::default();
-        let loaded = load_resources(
-            horizon_assets::resource_source::ResourceRoot::directory(root.clone()),
-            Vec::new(),
-            None,
-            &root,
-            &settings,
-            std::time::Instant::now(),
-            false,
-            crate::game::execution_role::ExecutionRole::IntegratedServer,
-            &Progress::new(),
-            &mut |_, _| unreachable!(),
-        )
-        .unwrap();
-        let mut options = Options::parse(std::iter::empty()).unwrap().unwrap();
-        options.resources = root.clone();
-        options.execution_role = ExecutionRole::Client;
-        let mut game = Game::new(
-            &loaded.resources,
-            loaded.pack,
-            loaded.gui.unwrap(),
-            options,
-            settings,
-            Audio::silent(&horizon_assets::resource_source::ResourceSource::directory(
-                root.clone(),
-            )),
-            None,
-        )
-        .unwrap();
-        let (first, _first_server) = horizon_protocol::connection::Pipe::pair();
-        game.connect_local(first, "HopTest").unwrap();
-        let stack = || Some(ItemStack::new("minecraft:shield", 1));
-        game.inventory[0] = stack();
-        game.armor[0] = stack();
-        game.offhand = stack();
-        let (second, _second_server) = horizon_protocol::connection::Pipe::pair();
-        game.connect_local(second, "HopTest").unwrap();
-        assert!(game.inventory[0].is_none() && game.armor[0].is_none());
-        assert!(game.offhand.is_none());
-    }
-
-    #[test]
-    fn the_chunk_storage_takes_any_radius_and_centre_a_server_sends() {
-        use super::in_storage_range;
-        // Vanilla's storage: radius at least 2, plus 3, each way from the centre.
-        assert!(in_storage_range(10, (0, 0), 13, -13));
-        assert!(!in_storage_range(10, (0, 0), 14, 0));
-        assert!(in_storage_range(-5, (100, 100), 105, 95));
-        assert!(!in_storage_range(0, (100, 100), 106, 100));
-        // Out of i32's range, as a server may send: no overflow, and the sums a wrap got wrong.
-        assert!(in_storage_range(i32::MAX, (0, 0), i32::MAX, i32::MIN + 1));
-        assert!(!in_storage_range(10, (i32::MIN, 0), i32::MAX, 0));
-        assert!(in_storage_range(
-            10,
-            (i32::MIN, i32::MAX),
-            i32::MIN + 13,
-            i32::MAX - 13
-        ));
-    }
-
-    use super::{
-        boat_interact_passes, chat_after_event, client_has_level, hold_server_fire,
-        item_frame_interact_passes, keep_client_state, open_hash_order, remote_object_swings,
-        remote_use_swings, shape_meets, snap_target, synced_local_use,
-    };
-
-    #[test]
-    #[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES and scratch homes/cwd"]
-    fn tracking_emitters_follow_the_packet_target() {
-        use crate::game::{
-            Audio, Game, Options, Progress, Settings, execution_role::ExecutionRole,
-            load_resources, totem::TOTEM_EVENT,
-        };
-        use horizon_client::{motion::PlayerMotion, particles::ParticleType, pose::Pose};
-        use horizon_core::geometry::Vec3;
-        use horizon_protocol::{
-            entity_data::{Value, serializer},
-            packets::play::{self, Clientbound as C},
-        };
-
-        let root = std::path::PathBuf::from(std::env::var_os("HORIZON_TEST_RESOURCES").unwrap());
-        let settings = Settings::default();
-        let loaded = load_resources(
-            horizon_assets::resource_source::ResourceRoot::directory(root.clone()),
-            Vec::new(),
-            None,
-            &root,
-            &settings,
-            std::time::Instant::now(),
-            false,
-            crate::game::execution_role::ExecutionRole::IntegratedServer,
-            &Progress::new(),
-            &mut |_, _| unreachable!(),
-        )
-        .unwrap();
-        let mut options = Options::parse(std::iter::empty()).unwrap().unwrap();
-        options.resources = root.clone();
-        options.execution_role = ExecutionRole::Client;
-        let mut game = Game::new(
-            &loaded.resources,
-            loaded.pack,
-            loaded.gui.unwrap(),
-            options,
-            settings,
-            Audio::silent(&horizon_assets::resource_source::ResourceSource::directory(
-                root.clone(),
-            )),
-            None,
-        )
-        .unwrap();
-        let (client, _server) = horizon_protocol::connection::Pipe::pair();
-        game.connect_local(client, "EmitterTest").unwrap();
-        game.remote.as_mut().unwrap().entity_id = 7;
-        game.player = Some(PlayerMotion::new(game.motion, Vec3::new(0.0, 64.0, 0.0)).unwrap());
-        game.particles.seed_randoms(42, 43, 44);
-
-        let check = |game: &Game<'_>, ty, feet: [f64; 3], height: f32| {
-            let mut seen = false;
-            for (options, at, velocity) in game.particles.requested.as_ref().unwrap() {
-                if options.ty != ty {
-                    continue;
-                }
-                seen = true;
-                let y = feet[1] + f64::from(height) * (0.5 + (velocity[1] - 0.2) / 4.0);
-                assert!((at[0] - feet[0]).abs() <= f64::from(0.6_f32) / 4.0);
-                assert!(
-                    (at[1] - y).abs() < 1e-10,
-                    "{ty:?} at {at:?}, expected y {y}"
-                );
-                assert!((at[2] - feet[2]).abs() <= f64::from(0.6_f32) / 4.0);
-            }
-            assert!(seen, "no {ty:?} emissions");
-        };
-        let types = [
-            ParticleType::Crit,
-            ParticleType::EnchantedHit,
-            ParticleType::TotemOfUndying,
-        ];
-        let target = 40;
-        let start = [5.0, 64.0, 7.0];
-        game.spawn_entity(target, "minecraft:player", start, [0.0; 3]);
-        game.particles.requested = Some(Vec::new());
-        for action in [1, 2] {
-            game.handle_packet(C::Animate(play::Animate { id: target, action }))
-                .unwrap();
-        }
-        game.handle_packet(C::EntityEvent(play::EntityEvent {
-            id: target,
-            event: TOTEM_EVENT,
-        }))
-        .unwrap();
-        for ty in types {
-            check(&game, ty, start, 1.8);
-        }
-
-        let moved = [15.0, 65.0, -2.0];
-        game.particles.requested = Some(Vec::new());
-        game.handle_packet(C::SetEntityData(play::SetEntityData {
-            id: target,
-            values: vec![(6, serializer::POSE, Value::Id(Pose::Crouching.id()))],
-        }))
-        .unwrap();
-        game.handle_packet(C::EntityPositionSync(play::EntityPositionSync {
-            id: target,
-            path: play::PositionPath::Linear(moved),
-            yaw: 0.0,
-            pitch: 0.0,
-            on_ground: true,
-        }))
-        .unwrap();
-        for _ in 0..4 {
-            game.tick_remote_entities(true);
-        }
-        game.tick_particles();
-        for ty in types {
-            check(&game, ty, moved, 1.5);
-        }
-
-        // The old entity moved again before unpairing. Re-pairing its id before
-        // the next particle tick keeps emitting at the old entity's final body.
-        game.particles.requested = Some(Vec::new());
-        let last = [18.0, 65.0, -2.0];
-        game.mob_index
-            .get_mut(&mut game.mobs, target as u32)
-            .unwrap()
-            .position = Vec3::new(last[0], last[1], last[2]);
-        game.handle_packet(C::RemoveEntities(play::RemoveEntities {
-            ids: vec![target],
-        }))
-        .unwrap();
-        game.spawn_entity(target, "minecraft:player", [28.0, 67.0, 1.0], [0.0; 3]);
-        game.tick_particles();
-        for ty in types {
-            check(&game, ty, last, 1.5);
-        }
-
-        game.particles.clear();
-        game.particles.requested = Some(Vec::new());
-        game.handle_packet(C::EntityEvent(play::EntityEvent {
-            id: 7,
-            event: TOTEM_EVENT,
-        }))
-        .unwrap();
-        check(&game, ParticleType::TotemOfUndying, [0.0, 64.0, 0.0], 1.8);
-        game.particles.requested = Some(Vec::new());
-        let player = game.player.as_mut().unwrap();
-        player.position = Vec3::new(-4.0, 68.0, 8.0);
-        player.set_pose(Pose::Swimming).unwrap();
-        game.tick_particles();
-        check(&game, ParticleType::TotemOfUndying, [-4.0, 68.0, 8.0], 0.6);
-    }
-
-    /// The vanilla 26.3 client's ServerboundContainerClickPacket for a shift-click from hotbar slot 37
-    /// into slot 10 listed 37 first (wire stream harness, `inventory`). The key 0 always leads.
-    #[test]
-    fn changed_slots_go_out_in_the_order_vanilla_s_hash_map_iterates() {
-        assert_eq!(open_hash_order(&[10, 37]), [37, 10]);
-        assert_eq!(open_hash_order(&[0, 1, 2, 36, 44])[0], 0);
-        // Past 24 keys the table grows; every key is still listed once.
-        let all: Vec<i16> = (0..46).collect();
-        let mut out = open_hash_order(&all);
-        out.sort_unstable();
-        assert_eq!(out, all);
-    }
-
-    #[test]
-    fn typed_chat_is_sent_as_the_client_chat_event_leaves_it() {
-        assert_eq!(chat_after_event("hello", |_, _| {}), Some("hello".into()));
-        assert_eq!(
-            chat_after_event("hello", |m, _| m.push_str(" world")),
-            Some("hello world".into())
-        );
-        assert_eq!(chat_after_event("hello", |_, c| *c = true), None);
-        assert_eq!(chat_after_event("hello", |m, _| m.clear()), None);
-    }
-
-    #[test]
-    #[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
-    fn block_alias_survival_consumption_and_client_prediction() {
-        use crate::game::{Audio, Game, Options, Progress, Settings, World, load_resources};
-        use horizon_client::{
-            chunk::Chunk,
-            items::ItemStack,
-            mod_content::{ContentMod, build},
-        };
-        use horizon_mod_package::content::{Block, Content, Item};
-        use std::{path::PathBuf, sync::Arc};
-        let base = PathBuf::from(
-            std::env::var_os("HORIZON_TEST_RESOURCES").expect("prepared resources required"),
-        );
-        let root = std::env::temp_dir().join(format!("horizon-alias-game-{}", std::process::id()));
-        let mut content = Content::declared("ruby");
-        content
-            .declare(
-                &[Block {
-                    id: "ruby:frame".into(),
-                    template: "minecraft:stone".into(),
-                    item: false,
-                    ..Default::default()
-                }],
-                &["empty", "filled"].map(|name| Item {
-                    id: format!("ruby:{name}"),
-                    template: "minecraft:stick".into(),
-                    block: Some("ruby:frame".into()),
-                    ..Default::default()
-                }),
-            )
-            .unwrap();
-        let mods = [ContentMod {
-            id: "ruby".into(),
-            content,
-            jars: Vec::new(),
-        }];
-        let inventory = horizon_mod_package::enabled::EnabledMods::new([(
-            "ruby".to_owned(),
-            horizon_mod_package::Side::Both,
-        )]);
-        build(&base, std::path::Path::new(""), &mods, &root, &inventory).unwrap();
-        let (registry, _) = horizon_world::level::data::load_registry_with_flags(&root).unwrap();
-        crate::game::api_values::register_game_keys((0..registry.len()).map(|id| {
-            registry
-                .state(horizon_world::registry::BlockStateId(id as u32))
-                .unwrap()
-                .name
-                .clone()
-        }));
-        let settings = Settings::default();
-        let loaded = load_resources(
-            horizon_assets::resource_source::ResourceRoot::directory(root.clone()),
-            Vec::new(),
-            None,
-            &root,
-            &settings,
-            std::time::Instant::now(),
-            false,
-            crate::game::execution_role::ExecutionRole::IntegratedServer,
-            &Progress::new(),
-            &mut |_, _| unreachable!(),
-        )
-        .unwrap();
-        let mut options = Options::parse(std::iter::empty()).unwrap().unwrap();
-        options.resources = root.clone();
-        options.execution_role = crate::game::execution_role::ExecutionRole::IntegratedServer;
-        let mut game = Game::new(
-            &loaded.resources,
-            loaded.pack,
-            loaded.gui.unwrap(),
-            options,
-            settings,
-            Audio::silent(&horizon_assets::resource_source::ResourceSource::directory(
-                root.clone(),
-            )),
-            None,
-        )
-        .unwrap();
-        game.world = World::new(game.res.facts().air, 1);
-        for x in -1..=1 {
-            for z in -1..=1 {
-                game.world
-                    .chunks
-                    .insert((x, z), Arc::new(Chunk::empty(x, z)));
-            }
-        }
-        game.sync_tick_chunks();
-        game.set_mode_id(0);
-        game.player = None;
-        game.selected = 0;
-        let target = game
-            .pack
-            .assets
-            .registry
-            .default_state("ruby:frame")
-            .unwrap();
-        for (i, name) in ["ruby:empty", "ruby:filled"].iter().enumerate() {
-            let pos = [i as i32 * 2, 70, 0];
-            let hit = crate::game::Hit {
-                pos,
-                face: [0, 1, 0],
-                inside: false,
-                point: [f64::from(pos[0]) + 0.5, 70.0, 0.5],
-            };
-            let stack = ItemStack::new(name, 2);
-            assert_eq!(game.items().get(name).unwrap().block, Some(target));
-            let preview = game
-                .remote_can_place(&hit, &stack)
-                .expect("client predicts the alias");
-            assert_eq!([preview.0.x, preview.0.y, preview.0.z], pos);
-            assert_eq!(
-                game.world.block(pos[0], pos[1], pos[2]),
-                game.res.facts().air,
-                "prediction is dry"
-            );
-            *game.held_mut() = Some(stack);
-            assert!(game.use_hand(Some(&hit)).unwrap());
-            assert_eq!(game.world.block(pos[0], pos[1], pos[2]), target);
-            let held = game.held().unwrap();
-            assert_eq!((&*held.item, held.count), (*name, 1));
-        }
-        let blocked = crate::game::Hit {
-            pos: [0, 70, 0],
-            face: [0, 1, 0],
-            inside: false,
-            point: [0.5, 71.0, 0.5],
-        };
-        game.set_mode_id(2);
-        let before = game.held().cloned();
-        game.use_hand(Some(&blocked)).unwrap();
-        assert_eq!(
-            game.held(),
-            before.as_ref(),
-            "adventure refusal keeps the alias stack"
-        );
-        drop(game);
-        std::fs::remove_dir_all(root).unwrap();
-    }
-
-    use horizon_client::{
-        containers::{Beacon, BlockEntity},
-        items::ItemStack,
-    };
-    use horizon_core::nbt::Tag;
-
-    /// #12040: a server's client moves at the speed the server's attributes give it, never its
-    /// effects' own. Vanilla's server removes a Speed that runs out in ServerPlayer.doTick, after
-    /// the tick's sendDirtyEntityData: ClientboundRemoveMobEffectPacket goes out at once and the
-    /// movement speed without the effect's modifier a tick later, so for that tick the client still
-    /// runs fast (a potion drunk starts the same way). A client a tick off is what GrimAC's
-    /// Simulation flagged.
-    #[test]
-    #[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
-    fn a_servers_client_takes_its_speed_from_the_attributes_not_the_effect() {
-        use crate::game::{Audio, Game, Options, Progress, Settings, load_resources};
-        use horizon_client::motion::PlayerMotion;
-        use horizon_core::geometry::Vec3;
-        use horizon_protocol::packets::play::{
-            AttributeModifier, AttributeSnapshot, Clientbound as C, RemoveMobEffect,
-            UpdateAttributes, UpdateMobEffect,
-        };
-        let root = std::path::PathBuf::from(
-            std::env::var_os("HORIZON_TEST_RESOURCES").expect("prepared resources required"),
-        );
-        let settings = Settings::default();
-        let loaded = load_resources(
-            horizon_assets::resource_source::ResourceRoot::directory(root.clone()),
-            Vec::new(),
-            None,
-            &root,
-            &settings,
-            std::time::Instant::now(),
-            false,
-            crate::game::execution_role::ExecutionRole::Client,
-            &Progress::new(),
-            &mut |_, _| unreachable!(),
-        )
-        .unwrap();
-        let mut options = Options::parse(std::iter::empty()).unwrap().unwrap();
-        options.resources = root.clone();
-        let mut game = Game::new(
-            &loaded.resources,
-            loaded.pack,
-            loaded.gui.unwrap(),
-            options,
-            settings,
-            Audio::silent(&horizon_assets::resource_source::ResourceSource::directory(
-                root.clone(),
-            )),
-            None,
-        )
-        .unwrap();
-        game.init_remote_for_replay().unwrap();
-        game.player = Some(PlayerMotion::new(game.motion, Vec3::new(0.5, 64.0, 0.5)).unwrap());
-        let me = game.remote.as_ref().unwrap().entity_id;
-        let speed = game.remote_effect_network_id("speed").unwrap();
-        let attribute = {
-            let p = game.player.as_ref().unwrap();
-            let key = p.attributes.key("minecraft:movement_speed").unwrap();
-            key.attribute().registry_id()
-        };
-        // Player.createAttributes: 0.1F.
-        let walking = f64::from(0.1f32);
-        // Speed II: 0.2 (a float) a level, multiplying the total.
-        let amount = f64::from(0.2f32) * 2.0;
-        let attributes = |sped: bool| {
-            C::UpdateAttributes(UpdateAttributes {
-                id: me,
-                values: vec![AttributeSnapshot {
-                    attribute,
-                    base: walking,
-                    modifiers: sped
-                        .then(|| AttributeModifier {
-                            id: "minecraft:effect.speed".into(),
-                            amount,
-                            operation: 2,
-                        })
-                        .into_iter()
-                        .collect(),
-                }],
-            })
-        };
-        // Each step: the packets of one server tick, then a client tick.
-        let mut step = |packets: Vec<C>| {
-            for packet in packets {
-                game.handle_packet(packet).unwrap();
-            }
-            game.tick_client_effects();
-            game.player
-                .as_mut()
-                .unwrap()
-                .attribute("minecraft:movement_speed")
-                .unwrap()
-        };
-        let effect = C::UpdateMobEffect(UpdateMobEffect {
-            id: me,
-            effect: speed,
-            amplifier: 1,
-            duration: 60,
-            flags: 2 | 4,
-        });
-        let fast = walking * (1.0 + amount);
-        let close = |a: f64, b: f64| (a - b).abs() < 1e-9;
-        let seen = [
-            step(vec![effect]),
-            step(vec![attributes(true)]),
-            step(Vec::new()),
-            step(vec![C::RemoveMobEffect(RemoveMobEffect {
-                id: me,
-                effect: speed,
-            })]),
-            step(vec![attributes(false)]),
-        ];
-        let expected = [walking, fast, fast, fast, walking];
-        assert!(
-            seen.iter().zip(expected).all(|(&s, e)| close(s, e)),
-            "speed on each tick: {seen:?}, vanilla's client: {expected:?}"
-        );
-    }
-
-    /// `ItemFrame.interact`, `AbstractBoat.interact`, and `Minecart.interact`:
-    /// interactions that pass leave the click to the held item without swinging;
-    /// vehicle boarding answers CONSUME and ends the click without a predicted swing (#9120).
-    #[test]
-    fn object_interactions_pass_and_swing_vanilla() {
-        // ItemFrame: fixed frame or empty frame + empty hand passes.
-        assert!(item_frame_interact_passes(true, true, true));
-        assert!(item_frame_interact_passes(true, false, false));
-        assert!(item_frame_interact_passes(false, false, false));
-        // ItemFrame: inserting or rotating item does not pass.
-        assert!(!item_frame_interact_passes(false, true, false)); // rotates
-        assert!(!item_frame_interact_passes(false, false, true)); // inserts
-        assert!(!item_frame_interact_passes(false, true, true)); // rotates
-
-        // Boat: sneaking or out of control passes.
-        assert!(boat_interact_passes(false, true, false, true)); // sneaking
-        assert!(boat_interact_passes(false, false, true, true)); // out of control
-        // Boat: the client answers SUCCESS, room or not (startRiding is the server's).
-        assert!(!boat_interact_passes(false, false, false, true));
-        assert!(!boat_interact_passes(false, false, false, false));
-
-        // Chest boat: sneaking opens the chest; boarding answers SUCCESS.
-        assert!(!boat_interact_passes(true, true, false, true)); // opens chest
-        assert!(!boat_interact_passes(true, false, false, false)); // boards (client)
-        // Chest boat out of control: passes with room, else opens the chest.
-        assert!(boat_interact_passes(true, false, true, true));
-        assert!(!boat_interact_passes(true, false, true, false));
-
-        // Swings: boarding a rideable cart answers CONSUME (no swing).
-        assert!(!remote_object_swings(None, true));
-        // Swings: other object interactions, a boat's boarding too, answer SUCCESS.
-        assert!(remote_object_swings(None, false));
-        // Interaction entities honor response.
-        assert!(remote_object_swings(Some(true), false));
-        assert!(!remote_object_swings(Some(false), false));
-    }
-
-    /// A mod's pre-filled chat opens only over the world, with its text
-    /// typed in and nothing sent.
-    #[test]
-    #[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
-    fn mod_open_chat_fills_the_box_only_over_the_world() {
-        use super::super::{
-            Audio, Game, Options, Progress, Screen, Settings, execution_role::ExecutionRole,
-            load_resources,
-        };
-
-        let root = std::path::PathBuf::from(
-            std::env::var_os("HORIZON_TEST_RESOURCES")
-                .expect("set HORIZON_TEST_RESOURCES to prepared resources"),
-        );
-        let settings = Settings::default();
-        let loaded = load_resources(
-            horizon_assets::resource_source::ResourceRoot::directory(root.clone()),
-            Vec::new(),
-            None,
-            &root,
-            &settings,
-            std::time::Instant::now(),
-            false,
-            crate::game::execution_role::ExecutionRole::IntegratedServer,
-            &Progress::new(),
-            &mut |_, _| unreachable!("no menu handoff"),
-        )
-        .unwrap();
-        let mut options = Options::parse(std::iter::empty()).unwrap().unwrap();
-        options.resources = root.clone();
-        options.execution_role = ExecutionRole::Client;
-        let mut game = Game::new(
-            &loaded.resources,
-            loaded.pack,
-            loaded.gui.unwrap(),
-            options,
-            settings,
-            Audio::silent(&horizon_assets::resource_source::ResourceSource::directory(
-                root.clone(),
-            )),
-            None,
-        )
-        .unwrap();
-
-        // No player: the title screen.
-        game.player = None;
-        assert!(game.open_chat("/tp ").is_err());
-        assert!(game.ui.chat_screen.is_none());
-        game.player = Some(
-            horizon_client::motion::PlayerMotion::new(
-                game.motion,
-                horizon_core::geometry::Vec3::ZERO,
-            )
-            .unwrap(),
-        );
-        game.screen = Screen::Paused;
-        assert!(game.open_chat("/tp ").is_err());
-        assert!(game.ui.chat_screen.is_none());
-        game.screen = Screen::Playing;
-        assert!(game.open_chat("/tp ").is_ok());
-        assert!(game.screen == Screen::Chat);
-        assert_eq!(game.ui.chat_screen.as_ref().unwrap().input.value, "/tp ");
-        // The chat is a screen too: a second call doesn't replace what's typed.
-        assert!(game.open_chat("hello").is_err());
-        assert_eq!(game.ui.chat_screen.as_ref().unwrap().input.value, "/tp ");
-    }
-
-    /// The packet riding graph must retain invisible intermediary entities. A custom
-    /// sit plugin can use an area-effect cloud, whose server position stops updating
-    /// while it rides a player, with a player or marker stand as its own passenger.
-    #[test]
-    #[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
-    fn plugin_player_stack_follows_network_moves_and_local_carriers() {
-        use super::super::{
-            Audio, Game, Options, Progress, Settings, execution_role::ExecutionRole, load_resources,
-        };
-        use horizon_client::{motion::PlayerMotion, sprint::Keys};
-        use horizon_core::geometry::Vec3;
-        use horizon_protocol::packets::play::{self, Clientbound as C};
-        let root = std::path::PathBuf::from(std::env::var_os("HORIZON_TEST_RESOURCES").unwrap());
-        let settings = Settings::default();
-        let loaded = load_resources(
-            horizon_assets::resource_source::ResourceRoot::directory(root.clone()),
-            Vec::new(),
-            None,
-            &root,
-            &settings,
-            std::time::Instant::now(),
-            false,
-            ExecutionRole::Client,
-            &Progress::new(),
-            &mut |_, _| unreachable!(),
-        )
-        .unwrap();
-        let mut options = Options::parse(std::iter::empty()).unwrap().unwrap();
-        options.resources = root.clone();
-        options.execution_role = ExecutionRole::Client;
-        let mut game = Game::new(
-            &loaded.resources,
-            loaded.pack,
-            loaded.gui.unwrap(),
-            options,
-            settings,
-            Audio::silent(&horizon_assets::resource_source::ResourceSource::directory(
-                root.clone(),
-            )),
-            None,
-        )
-        .unwrap();
-        let (client, _server) = horizon_protocol::connection::Pipe::pair();
-        game.connect_local(client, "SeatTest").unwrap();
-        game.remote.as_mut().unwrap().entity_id = 7;
-        game.player = Some(PlayerMotion::new(game.motion, Vec3::ZERO).unwrap());
-        game.spawn_entity(40, "minecraft:player", [2.0, 64.0, 3.0], [0.0; 3]);
-        game.spawn_entity(41, "minecraft:player", [0.0, 64.0, 0.0], [0.0; 3]);
-        game.spawn_entity(42, "minecraft:area_effect_cloud", [0.0; 3], [0.0; 3]);
-        let set = |g: &mut Game<'_>, vehicle, passengers: Vec<i32>| {
-            g.handle_packet(C::SetPassengers(play::SetPassengers {
-                vehicle,
-                passengers,
-            }))
-            .unwrap();
-        };
-        set(&mut game, 40, vec![42]);
-        set(&mut game, 42, vec![7, 41]);
-        let close = |at: Vec3, x: f64, y: f64, z: f64| {
-            assert!(
-                (at.x - x).abs() < 1e-5 && (at.y - y).abs() < 1e-5 && (at.z - z).abs() < 1e-5,
-                "position {at:?}, expected [{x}, {y}, {z}]"
-            );
-        };
-        assert!(game.remote_ride(Keys::default(), 0).unwrap());
-        close(game.player.as_ref().unwrap().position, 2.0, 65.7, 3.0);
-        close(
-            game.mobs.iter().find(|m| m.id == 41).unwrap().position,
-            2.0,
-            65.7,
-            3.0,
-        );
-        game.handle_packet(C::EntityPositionSync(play::EntityPositionSync {
-            id: 40,
-            path: play::PositionPath::Linear([12.0, 67.0, -4.0]),
-            yaw: 45.0,
-            pitch: 0.0,
-            on_ground: true,
-        }))
-        .unwrap();
-        for _ in 0..4 {
-            game.tick_remote_entities(true);
-            game.remote_ride(Keys::default(), 0).unwrap();
-        }
-        close(game.player.as_ref().unwrap().position, 12.0, 68.7, -4.0);
-        close(
-            game.mobs.iter().find(|m| m.id == 41).unwrap().position,
-            12.0,
-            68.7,
-            -4.0,
-        );
-        // The intermediary's packet position must remain unchanged for relative decoding.
-        assert_eq!(
-            game.remote.as_ref().unwrap().tracked(42).unwrap().1,
-            [0.0; 3]
-        );
-        // A remote player riding the local player must follow our own movement too.
-        set(&mut game, 42, vec![41]);
-        set(&mut game, 7, vec![42]);
-        game.player.as_mut().unwrap().position = Vec3::new(20.0, 70.0, 25.0);
-        game.position_riders();
-        close(
-            game.mobs.iter().find(|m| m.id == 41).unwrap().position,
-            20.0,
-            71.7,
-            25.0,
-        );
-        // A direct stack has no intermediary's 0.5-height offset.
-        set(&mut game, 40, vec![7, 41]);
-        game.remote_ride(Keys::default(), 0).unwrap();
-        close(game.player.as_ref().unwrap().position, 12.0, 68.2, -4.0);
-        close(
-            game.mobs.iter().find(|m| m.id == 41).unwrap().position,
-            12.0,
-            68.2,
-            -4.0,
-        );
-        // Removing the carrier detaches passengers even without a final empty packet.
-        game.remove_entity(40);
-        assert_eq!(game.riding, None);
-        assert_eq!(
-            game.mobs.iter().find(|m| m.id == 41).unwrap().extra.mount,
-            None
-        );
-    }
-
-    /// `Entity.isColliding` and the snap `ClientLevel.syncBlockState` makes: a
-    /// block the server puts back where the player stands sends it to the
-    /// position the prediction remembered, and a block that comes back clear of
-    /// the player, an empty one, or one the player has been teleported since
-    /// leaves it where it is.
-    #[test]
-    fn a_block_the_server_puts_back_snaps_the_player_out_of_it() {
-        use horizon_core::geometry::{Aabb, Vec3, VoxelShape};
-        // A player standing in block (0, 64, 0): 0.6 wide, 1.8 tall.
-        let player = Aabb::new(Vec3::new(0.2, 64.0, 0.2), Vec3::new(0.8, 65.8, 0.8));
-        let cube = VoxelShape::block();
-        assert!(
-            shape_meets(&cube, [0, 64, 0], player),
-            "the block the player is standing in"
-        );
-        assert!(!shape_meets(&cube, [0, 66, 0], player), "above its head");
-        assert!(
-            !shape_meets(&cube, [1, 64, 0], player),
-            "the block beside it"
-        );
-        assert!(!shape_meets(&VoxelShape::empty(), [0, 64, 0], player));
-
-        // The snap itself: the remembered position, unless a teleport came after
-        // the prediction (`lastTeleportSequence < sequence`).
-        let at = [0.5, 64.0, 0.5];
-        assert_eq!(snap_target(at, -1, 3, true), Some(at));
-        assert_eq!(snap_target(at, -1, 3, false), None, "a block it clears");
-        assert_eq!(snap_target(at, 3, 3, true), None, "teleported at 3");
-        assert_eq!(
-            snap_target(at, 2, 3, true),
-            Some(at),
-            "teleported before it"
-        );
-    }
-
-    /// `MultiPlayerGameMode.useItem`'s `shouldSwing`: the SUCCESS answers
-    /// swing, CONSUME's do not (#6425).
-    #[test]
-    fn a_thrown_item_swinging_on_a_server_and_a_charge_not() {
-        let stack = |id: &str| ItemStack::new(id, 1);
-        // SUCCESS: the throwables, a bucket, a boat, a bundle, a book, a map.
-        for id in [
-            "minecraft:ender_pearl",
-            "minecraft:splash_potion",
-            "minecraft:wind_charge",
-            "minecraft:snowball",
-            "minecraft:experience_bottle",
-            "minecraft:bucket",
-            "minecraft:oak_boat",
-            "minecraft:bundle",
-            "minecraft:writable_book",
-            "minecraft:map",
-        ] {
-            assert!(remote_use_swings(&stack(id), false), "{id} swings");
-        }
-        // CONSUME: the charges and startUsingInstantly's uses, a drinkable
-        // potion among them (`consumable` set).
-        for id in [
-            "minecraft:bow",
-            "minecraft:crossbow",
-            "minecraft:trident",
-            "minecraft:spyglass",
-            "minecraft:goat_horn",
-            "minecraft:ender_eye",
-        ] {
-            assert!(!remote_use_swings(&stack(id), false), "{id} does not swing");
-        }
-        // The kinetic weapons charge like a trident.
-        assert!(!remote_use_swings(&stack("minecraft:iron_spear"), false));
-        // A consumable (food, a drink) starts its use without a swing.
-        assert!(!remote_use_swings(&stack("minecraft:apple"), true));
-    }
-
-    /// Minecraft.tick: CLIENT_TICK_END only while a level exists. None before
-    /// the first Login (configuration has finished, the server has not placed
-    /// the player yet), and none from StartConfiguration until the next Login.
-    #[test]
-    fn tick_ends_need_the_level_the_login_makes() {
-        assert!(!client_has_level(false, None), "joined, waiting for Login");
-        assert!(client_has_level(true, None), "after Login");
-        assert!(!client_has_level(true, Some(40)), "reconfiguring");
-    }
-
-    /// #12148: a proxy moves the player to its next server. The last server's
-    /// columns stay until the next Login, but Reconfigured already put in the
-    /// next server's biome table, shorter when only the last server had a
-    /// biome the game lacks: the columns hold an id past it ("the len is 67
-    /// but the index is 67"). Vanilla's clearClientLevel leaves no player, so
-    /// getSituationalMusic is MENU, and ServerReconfigScreen (no
-    /// LevelLoadingScreen) lets MusicManager.tick start it.
-    #[test]
-    #[ignore = "needs prepared resources in HORIZON_TEST_RESOURCES"]
-    fn a_reconfiguring_client_plays_menu_music_and_never_indexes_past_the_biomes() {
-        use crate::game::{Audio, Game, Options, Progress, Settings, load_resources};
-        use horizon_client::{chunk::Chunk, music::Music};
-        use horizon_core::geometry::Vec3;
-        let root = std::path::PathBuf::from(
-            std::env::var_os("HORIZON_TEST_RESOURCES").expect("prepared resources required"),
-        );
-        let settings = Settings::default();
-        let loaded = load_resources(
-            horizon_assets::resource_source::ResourceRoot::directory(root.clone()),
-            Vec::new(),
-            None,
-            &root,
-            &settings,
-            std::time::Instant::now(),
-            false,
-            crate::game::execution_role::ExecutionRole::Client,
-            &Progress::new(),
-            &mut |_, _| unreachable!(),
-        )
-        .unwrap();
-        let mut options = Options::parse(std::iter::empty()).unwrap().unwrap();
-        options.resources = root.clone();
-        let mut game = Game::new(
-            &loaded.resources,
-            loaded.pack,
-            loaded.gui.unwrap(),
-            options,
-            settings,
-            Audio::silent(&horizon_assets::resource_source::ResourceSource::directory(
-                root.clone(),
-            )),
-            None,
-        )
-        .unwrap();
-        game.init_remote_for_replay().unwrap();
-        // The last server's column at the origin: its extra biome came after
-        // the built-in ones, one past the table the next server leaves.
-        let stale = world_biomes!(game).list.len() as u16;
-        let mut column = Chunk::empty(0, 0);
-        // Quart 16 above the column's bottom at -64: block y 0.
-        column.set_biome_cell(0, 16, 0, stale);
-        game.world
-            .chunks
-            .insert((0, 0), std::sync::Arc::new(column));
-        assert_eq!(game.biome_at([0.0; 3]), "minecraft:plains");
-        assert_eq!(
-            game.biome_name_at(Vec3::new(0.5, 0.5, 0.5)).as_deref(),
-            Some("minecraft:plains")
-        );
-
-        // StartConfiguration after a Login: no player, ServerReconfigScreen.
-        let ticks = game.ticks;
-        let r = game.remote.as_mut().unwrap();
-        r.logged_in = true;
-        r.reconfiguring = Some(ticks);
-        game.player = None;
-        assert_eq!(game.situational_music().0, Some(Music::menu()));
-        // A new manager waits its first 100 ticks, then starts the menu track.
-        let menu = (0..=100).any(|_| {
-            game.tick_music();
-            game.music.current(&game.audio.engine) == Some("minecraft:music.menu")
-        });
-        assert!(menu, "the menu music starts under ServerReconfigScreen");
-
-        // With a level again the camera probe reads that column: plains' music.
-        game.remote.as_mut().unwrap().reconfiguring = None;
-        let (music, _) = game.situational_music();
-        assert!(music.is_some_and(|m| m != Music::menu()));
-    }
-
-    /// The server's on-fire flag keeps the predicted countdown (which
-    /// `fluid_base_tick` runs down) from ending the fire; a clear flag leaves
-    /// the window's own contact fire alone.
-    #[test]
-    fn the_servers_fire_flag_holds_the_burning_state_through_the_countdown() {
-        let mut ticks = 1;
-        for _ in 0..5 {
-            ticks = hold_server_fire(ticks - 1, true);
-            assert!(ticks > 0, "still burning");
-        }
-        assert_eq!(hold_server_fire(300, true), 300, "a longer fire is not cut");
-        assert_eq!(hold_server_fire(7, false), 7, "predicted lava fire stays");
-        assert_eq!(hold_server_fire(0, false), 0);
-    }
-
-    #[test]
-    fn a_beacon_update_tag_keeps_the_beam_the_client_walked() {
-        let old = BlockEntity::Beacon(Box::new(Beacon {
-            levels: 1,
-            primary: Some("minecraft:speed".into()),
-            sections: vec![(0xF9FFFE, 2)],
-            checking: vec![(0xF9FFFE, 1)],
-            last_check_y: 70,
-            ..Default::default()
-        }));
-        // BeaconBlockEntity.getUpdateTag: saveCustomOnly.
-        let tag = Tag::compound([
-            ("id", Tag::String("minecraft:beacon".into())),
-            ("x", Tag::Int(0)),
-            ("y", Tag::Int(64)),
-            ("z", Tag::Int(0)),
-            ("primary_effect", Tag::String("minecraft:haste".into())),
-            (
-                "secondary_effect",
-                Tag::String("minecraft:regeneration".into()),
-            ),
-            ("Levels", Tag::Int(4)),
-        ]);
-        let (_, mut new) = horizon_client::save::decode_block_entity(&tag).unwrap();
-        keep_client_state(Some(&old), &mut new);
-        let BlockEntity::Beacon(b) = new else {
-            panic!("not a beacon");
-        };
-        assert_eq!(b.sections, vec![(0xF9FFFE, 2)]);
-        assert_eq!(b.checking, vec![(0xF9FFFE, 1)]);
-        assert_eq!(b.last_check_y, 70);
-        // The powers are the tag's; the levels stay the client's own (not read).
-        assert_eq!(b.primary.as_deref(), Some("minecraft:haste"));
-        assert_eq!(b.secondary.as_deref(), Some("minecraft:regeneration"));
-        assert_eq!(b.levels, 1);
-    }
-
-    #[test]
-    fn the_server_stopping_the_use_lowers_the_shield() {
-        // Player.disableShield's stopUsingItem: flags 0 or 2 while the
-        // off-hand shield is raised (LocalPlayer.onSyncedDataUpdated â†’
-        // stopUsingItem). stopUsingItem clears bit 0 and leaves bit 1, so a
-        // main-hand stop is 0 and an off-hand stop is 2.
-        let off = super::super::shield::OFFHAND_SLOT;
-        assert_eq!(synced_local_use(Some((off, 12)), 0, 3, |_| true), None);
-        assert_eq!(synced_local_use(Some((3, 5)), 0, 3, |_| true), None);
-        assert_eq!(synced_local_use(Some((off, 12)), 2, 3, |_| true), None);
-    }
-
-    #[test]
-    fn the_server_starting_a_use_starts_it_in_that_hand() {
-        let off = super::super::shield::OFFHAND_SLOT;
-        assert_eq!(synced_local_use(None, 1, 4, |_| true), Some((4, 0)));
-        assert_eq!(synced_local_use(None, 3, 4, |_| true), Some((off, 0)));
-        // LivingEntity.startUsingItem needs an item in the hand.
-        assert_eq!(synced_local_use(None, 1, 4, |_| false), None);
-    }
-
-    /// tooBigToInterpolate: a position sync measures from where the entity
-    /// is, a teleport from where its interpolation is headed.
-    #[test]
-    fn a_far_move_snaps_by_the_packets_own_measure() {
-        use super::{MovePacket, Path, PosRot, SteppedInterpolation};
-        let at = |x: f64| PosRot {
-            position: [x, 0.0, 0.0],
-            yaw: 0.0,
-            pitch: 0.0,
-        };
-        let mut handler = SteppedInterpolation::new(3);
-        // At x 0, headed for x 50.
-        handler.interpolate_to(at(0.0), Some(Path::Linear([50.0, 0.0, 0.0])), None);
-        let to = [100.0, 0.0, 0.0];
-        assert!(MovePacket::PositionSync.snaps(&handler, at(0.0), to));
-        assert!(!MovePacket::Teleport.snaps(&handler, at(0.0), to));
-        assert!(!MovePacket::Move.snaps(&handler, at(0.0), to));
-        // With nothing in flight, both measure from the entity.
-        let idle = SteppedInterpolation::new(3);
-        assert!(MovePacket::Teleport.snaps(&idle, at(0.0), to));
-        assert!(!MovePacket::Teleport.snaps(&idle, at(0.0), [60.0, 0.0, 0.0]));
-    }
-
-    /// A far sync puts the entity there and drops the steps it was walking;
-    /// a rotation alone keeps the position it is headed for and turns there
-    /// over the update interval.
-    #[test]
-    fn a_living_entitys_move_snaps_or_steps() {
-        use super::{MovePacket, Path, PosRot, SteppedInterpolation, stepped_move};
-        let at = |x: f64, yaw: f32| PosRot {
-            position: [x, 0.0, 0.0],
-            yaw,
-            pitch: 0.0,
-        };
-        let mut handler = SteppedInterpolation::new(3);
-        // Walking to x 5 when the far sync comes.
-        handler.interpolate_to(at(0.0, 0.0), Some(Path::Linear([5.0, 0.0, 0.0])), None);
-        assert!(handler.active());
-        let far = [100.0, 0.0, 0.0];
-        let snap = stepped_move(
-            &mut handler,
-            MovePacket::PositionSync,
-            at(0.0, 0.0),
-            far,
-            Some(Path::Linear(far)),
-            Some((90.0, 0.0)),
-        );
-        assert_eq!(snap, Some(at(100.0, 90.0)));
-        assert!(!handler.active());
-        assert_eq!(handler.interpolate(), None, "no step back toward x 5");
-        // A rotation-only move packet.
-        let turn = stepped_move(
-            &mut handler,
-            MovePacket::Move,
-            at(100.0, 90.0),
-            far,
-            None,
-            Some((180.0, 0.0)),
-        );
-        assert_eq!(turn, None);
-        let steps: Vec<_> = std::iter::from_fn(|| handler.interpolate()).collect();
-        assert_eq!(
-            steps.iter().map(|s| s.yaw).collect::<Vec<_>>(),
-            [120.0, 150.0, 180.0]
-        );
-        assert!(steps.iter().all(|s| s.position == far));
-    }
-
-    #[test]
-    fn matching_flags_leave_a_running_use_alone() {
-        assert_eq!(synced_local_use(Some((2, 7)), 1, 2, |_| true), Some((2, 7)));
-        assert_eq!(synced_local_use(None, 0, 2, |_| true), None);
-    }
-
-    /// `ChatType.Bound.decorate` and `decorateNarration`: a private message
-    /// shows as "Steve whispers to you: hi" and is narrated "Steve says hi";
-    /// a chat type the registry lacks is `minecraft:chat`'s.
-    #[test]
-    fn chat_is_narrated_with_its_chat_types_narration_decoration() {
-        use super::{Decoration, chat_type_decorate, play};
-        use horizon_core::nbt::{JavaString, Tag, parse_snbt};
-        use serde_json::json;
-        let bound = play::ChatTypeBound {
-            chat_type: 0,
-            name: Tag::String(JavaString::from("Steve")),
-            target: None,
-        };
-        let content = json!("hi");
-        let (incoming, _) = parse_snbt(
-            r#"{chat:{translation_key:"commands.message.display.incoming",parameters:["sender","content"],style:{color:"gray",italic:1b}},narration:{translation_key:"chat.type.text.narrate",parameters:["sender","content"]}}"#,
-        )
-        .unwrap();
-        let chat = chat_type_decorate(Some(&incoming), Decoration::Chat, &bound, &content);
-        assert_eq!(chat["translate"], "commands.message.display.incoming");
-        assert_eq!(chat["color"], "gray");
-        assert_eq!(chat["with"], json!(["Steve", "hi"]));
-        assert_eq!(
-            chat_type_decorate(Some(&incoming), Decoration::Narration, &bound, &content),
-            json!({"translate": "chat.type.text.narrate", "with": ["Steve", "hi"]})
-        );
-        assert_eq!(
-            chat_type_decorate(None, Decoration::Narration, &bound, &content),
-            json!({"translate": "chat.type.text.narrate", "with": ["Steve", "hi"]})
-        );
-        assert_eq!(
-            chat_type_decorate(None, Decoration::Chat, &bound, &content)["translate"],
-            "chat.type.text"
-        );
-    }
-
-    /// A cauldron's fill level is a use this client predicts, and a guest's
-    /// host forwards its sound: every cauldron state counts, not only the
-    /// doors and levers.
-    #[test]
-    fn every_cauldron_counts_as_hand_operated() {
-        for name in [
-            "minecraft:cauldron",
-            "minecraft:water_cauldron",
-            "minecraft:lava_cauldron",
-            "minecraft:powder_snow_cauldron",
-        ] {
-            assert!(super::hand_operated(name), "{name}");
-        }
-        assert!(!super::hand_operated("minecraft:water"));
-    }
-
-    /// An NPC plugin lists the NPC, spawns it, and takes the entry off the list:
-    /// the entity keeps the skin it found; a player spawned before its entry
-    /// arrives takes the entry once it comes.
-    #[test]
-    fn a_player_entity_keeps_the_skin_its_entry_gave() {
-        use horizon_client::skins::Textures;
-        use std::collections::HashMap;
-        let npc = Textures {
-            skin: Some("http://textures.minecraft.net/texture/npc".into()),
-            signed: true,
-            ..Textures::default()
-        };
-        let (mut listed, mut kept) = (HashMap::from([(7u128, npc.clone())]), HashMap::new());
-        let mut players = HashMap::from([(2i32, 7u128), (3, 8)]);
-        assert_eq!(
-            super::skin_entries(&players, &listed, &mut kept),
-            [(7, npc.clone())]
-        );
-        listed.remove(&7);
-        assert_eq!(
-            super::skin_entries(&players, &listed, &mut kept),
-            [(7, npc.clone())]
-        );
-        // Player 8's entry comes after its entity.
-        let late = Textures {
-            skin: Some("http://textures.minecraft.net/texture/late".into()),
-            ..npc.clone()
-        };
-        listed.insert(8, late.clone());
-        let mut entries = super::skin_entries(&players, &listed, &mut kept);
-        entries.sort_by_key(|(u, _)| *u);
-        assert_eq!(entries, [(7, npc), (8, late)]);
-        // A removed entity forgets its profile with it.
-        players.remove(&2);
-        kept.remove(&2);
-        listed.clear();
-        assert_eq!(super::skin_entries(&players, &listed, &mut kept).len(), 1);
-    }
-
-    #[test]
-    fn tab_publication_fingerprint_tracks_all_inputs() {
-        let fingerprint = |ids: &[u128], skins, atlas| {
-            (
-                ids.len(),
-                ids.iter().fold(0, |xor, uuid| xor ^ uuid),
-                skins,
-                atlas,
-            )
-        };
-        let published = fingerprint(&[7, 8], 1, 2);
-        assert_eq!(published, fingerprint(&[8, 7], 1, 2));
-        assert_ne!(published, fingerprint(&[7, 9], 1, 2));
-        assert_ne!(published, fingerprint(&[7, 8], 2, 2));
-        assert_ne!(published, fingerprint(&[7, 8], 1, 3));
-    }
-
-    #[test]
-    fn tab_object_skin_publication_tracks_changes_and_atlas_clear() {
-        let mut published = std::collections::HashMap::new();
-        let mut writes = 0;
-        for skin in ["skins/first", "skins/first", "skins/second"] {
-            for key in ["id:7", "name:player"] {
-                if super::object_skin_changed(&published, key, skin) {
-                    published.insert(key.to_owned(), skin.to_owned());
-                    writes += 1;
-                }
-            }
-        }
-        assert_eq!(writes, 4, "unchanged skins do not publish either entry");
-        published.clear();
-        assert!(super::object_skin_changed(
-            &published,
-            "id:7",
-            "skins/second"
-        ));
-        assert!(super::object_skin_changed(
-            &published,
-            "name:player",
-            "skins/second"
-        ));
-    }
-
-    /// An NPC plugin's scale: a base the plugin sets, or a modifier on 1.
-    #[test]
-    fn attribute_values_add_then_multiply_as_vanilla() {
-        use horizon_protocol::packets::play::{AttributeModifier, AttributeSnapshot};
-        let modifier = |amount, operation| AttributeModifier {
-            id: "minecraft:proof".into(),
-            amount,
-            operation,
-        };
-        let snapshot = |base, modifiers| AttributeSnapshot {
-            attribute: 0,
-            base,
-            modifiers,
-        };
-        assert_eq!(super::snapshot_value(&snapshot(2.0, vec![])), 2.0);
-        assert_eq!(
-            super::snapshot_value(&snapshot(1.0, vec![modifier(1.0, 0)])),
-            2.0
-        );
-        // (1 + 1) * (1 + 0.5) from the base, then * (1 + 1) of the total.
-        let all = vec![modifier(1.0, 0), modifier(0.5, 1), modifier(1.0, 2)];
-        assert_eq!(super::snapshot_value(&snapshot(1.0, all)), 6.0);
-    }
-
-    use super::Game;
-
-    /// `Entity.lookAt`: yaw 0 faces +Z, -90 faces +X; pitch -90 looks up.
-    #[test]
-    fn look_at_turns_towards_the_target() {
-        let close = |(yaw, pitch): (f32, f32), want: (f32, f32)| {
-            assert!(
-                (yaw - want.0).abs() < 1e-3 && (pitch - want.1).abs() < 1e-3,
-                "{yaw} {pitch}, want {want:?}"
-            );
-        };
-        let at = [10.0, 64.0, -5.0];
-        let off = |d: [f64; 3]| [at[0] + d[0], at[1] + d[1], at[2] + d[2]];
-        close(
-            super::look_at_rotation(at, off([0.0, 0.0, 3.0])),
-            (0.0, 0.0),
-        );
-        close(
-            super::look_at_rotation(at, off([3.0, 0.0, 0.0])),
-            (-90.0, 0.0),
-        );
-        close(
-            super::look_at_rotation(at, off([-3.0, 0.0, 0.0])),
-            (90.0, 0.0),
-        );
-        close(
-            super::look_at_rotation(at, off([0.0, 0.0, -3.0])),
-            (-180.0, 0.0),
-        );
-        close(
-            super::look_at_rotation(at, off([0.0, 2.0, 2.0])),
-            (0.0, -45.0),
-        );
-        close(
-            super::look_at_rotation(at, off([0.0, -4.0, 4.0])),
-            (0.0, 45.0),
-        );
-    }
-
-    /// `handleMovePlayer` moves the player's pitch and the model's old pitch
-    /// (`xRotO`) alike: a relative change keeps the ease a tick began, each
-    /// end clamped on its own, and an absolute one snaps both (#3844).
-    #[test]
-    fn a_position_packet_moves_both_pitch_ends() {
-        use super::position_packet_pitch as pitch;
-        // The tick is laying the head down from 30 to 0; the packet turns 10.
-        assert_eq!(
-            (pitch(30.0, 10.0, true), pitch(0.0, 10.0, true)),
-            (40.0, 10.0)
-        );
-        // Each end clamps on its own.
-        assert_eq!(
-            (pitch(80.0, 20.0, true), pitch(60.0, 20.0, true)),
-            (90.0, 80.0)
-        );
-        // An absolute pitch ignores both ends.
-        assert_eq!(
-            (pitch(30.0, -45.0, false), pitch(0.0, -45.0, false)),
-            (-45.0, -45.0)
-        );
-        assert_eq!(pitch(0.0, 120.0, false), 90.0);
-    }
-
-    /// The hurt sound of `ClientboundDamageEventPacket` follows its damage
-    /// type (`Player.getHurtSound`: the type's effects), with the codec's
-    /// `hurt` default for an unknown type (#4149).
-    #[test]
-    fn the_hurt_sound_follows_the_damage_events_type() {
-        use super::hurt_sound_for;
-        use horizon_protocol::registry::Dynamic;
-        use horizon_world::damage_source::Catalog;
-        let types = [
-            ("minecraft:in_fire", "burning"),
-            ("minecraft:drown", "drowning"),
-            ("minecraft:sweet_berry_bush", "poking"),
-            ("minecraft:freeze", "freezing"),
-            ("minecraft:arrow", "hurt"),
-        ];
-        // The types the server synchronized, in registry order.
-        let mut registries = Dynamic::default();
-        registries.add(horizon_protocol::packets::configuration::RegistryData {
-            registry: "minecraft:damage_type".into(),
-            entries: types
-                .iter()
-                .map(
-                    |(id, _)| horizon_protocol::packets::configuration::RegistryEntry {
-                        id: (*id).into(),
-                        data: None,
-                    },
-                )
-                .collect(),
-        });
-        // The damage catalog: one entry per type above, each with its effects.
-        let bits = |f: f32| format!("{:08x}", f.to_bits());
-        let catalog = Catalog::from_json(
-            &serde_json::json!({
-                "data_version": i64::from(horizon_world::DATA_VERSION),
-                "types": types.iter().map(|(id, effects)| serde_json::json!({
-                    "id": id,
-                    "message_id": id.trim_start_matches("minecraft:"),
-                    "exhaustion": bits(0.1),
-                    "scaling": "when_caused_by_living_non_player",
-                    "effects": effects,
-                    "death_message_type": "default",
-                })).collect::<Vec<_>>(),
-            }),
-            &serde_json::json!({}),
-        )
-        .unwrap();
-        for (id, (name, effects)) in types.iter().enumerate() {
-            assert_eq!(
-                hurt_sound_for(&registries, &catalog, id as i32),
-                horizon_client::health::hurt_sound(effects),
-                "{name}"
-            );
-        }
-        // An unknown id falls back to the codec's default effects.
-        assert_eq!(
-            hurt_sound_for(&registries, &catalog, types.len() as i32),
-            "minecraft:entity.player.hurt"
-        );
-        // A server-defined damage type with inline NBT effects needs no entry in
-        // the client's built-in catalog.
-        let mut custom = horizon_core::nbt::Compound::new();
-        custom.insert(
-            "effects".into(),
-            horizon_core::nbt::Tag::String("burning".into()),
-        );
-        registries.add(horizon_protocol::packets::configuration::RegistryData {
-            registry: "minecraft:damage_type".into(),
-            entries: vec![horizon_protocol::packets::configuration::RegistryEntry {
-                id: "custom:lava_splash".into(),
-                data: Some(horizon_core::nbt::Tag::Compound(custom)),
-            }],
-        });
-        assert_eq!(
-            hurt_sound_for(&registries, &catalog, 0),
-            "minecraft:entity.player.hurt_on_fire"
-        );
-    }
-    #[test]
-    fn synchronized_damage_defaults_override_a_different_local_definition() {
-        let local = horizon_world::damage_source::Catalog::from_json(&serde_json::json!({
-            "data_version": horizon_world::DATA_VERSION,
-            "types": [{"id":"demo:heat", "message_id":"heat", "exhaustion":"00000000", "scaling":"never", "effects":"burning", "death_message_type":"default"}]
-        }), &serde_json::json!({})).unwrap();
-        let mut registries = horizon_protocol::registry::Dynamic::default();
-        registries.add(horizon_protocol::packets::configuration::RegistryData {
-            registry: "minecraft:damage_type".into(),
-            entries: vec![horizon_protocol::packets::configuration::RegistryEntry {
-                id: "demo:heat".into(),
-                data: Some(horizon_core::nbt::Tag::Compound(Default::default())),
-            }],
-        });
-        assert_eq!(
-            super::hurt_sound_for(&registries, &local, 0),
-            "minecraft:entity.player.hurt"
-        );
-    }
-    /// `ClientPacketListener.handleSetEntityPassengersPacket`: the vehicle
-    /// ejects its passengers, then each listed entity `startRiding`s it, so
-    /// `isVehicle` holds while the list is not empty, whatever the passenger's
-    /// type: a server's item display riding a player hides that player's name
-    /// tag like a text display does (#5666).
-    #[test]
-    fn any_tracked_passenger_makes_its_vehicle_a_vehicle() {
-        use std::collections::{HashMap, HashSet};
-        let tracked = |kind: &str| super::Tracked {
-            kind: kind.to_owned(),
-            position: [0.0, 64.0, 0.0],
-            codec_base: [0.0, 64.0, 0.0],
-            silent: false,
-            vehicle: None,
-        };
-        let mut entities = HashMap::from([
-            (42, tracked("minecraft:player")),
-            (43, tracked("minecraft:player")),
-            (9, tracked("minecraft:item_display")),
-            (10, tracked("minecraft:block_display")),
-        ]);
-        let vehicles = |e: &HashMap<i32, super::Tracked>| -> HashSet<u32> {
-            e.values().filter_map(|t| t.vehicle).collect()
-        };
-        super::seat_passengers(&mut entities, 42, &[9, 10]);
-        assert_eq!(vehicles(&entities), HashSet::from([42]));
-        // The list replaces the old one: 10 got off, 9 still rides.
-        super::seat_passengers(&mut entities, 42, &[9]);
-        assert_eq!(entities[&10].vehicle, None);
-        assert_eq!(entities[&9].vehicle, Some(42));
-        // startRiding leaves the old vehicle first.
-        super::seat_passengers(&mut entities, 43, &[9]);
-        assert_eq!(vehicles(&entities), HashSet::from([43]));
-        // An empty list: nobody rides 43 any more.
-        super::seat_passengers(&mut entities, 43, &[]);
-        assert!(vehicles(&entities).is_empty());
-    }
-    /// `ClientboundSoundEntityPacket`: the sound is heard where the entity it
-    /// names is â€” the local player included, which is no tracked entity â€” and
-    /// an id this level doesn't have plays nothing at all.
-    #[test]
-    fn a_sound_entity_is_heard_where_its_entity_is() {
-        use std::collections::HashMap;
-        let mut tracked = HashMap::new();
-        tracked.insert(
-            7,
-            super::Tracked {
-                kind: "minecraft:cow".to_owned(),
-                position: [8.5, 64.0, -3.5],
-                codec_base: [8.5, 64.0, -3.5],
-                silent: false,
-                vehicle: None,
-            },
-        );
-        let player = Some((2, [0.5, 70.0, 0.5], false));
-        assert_eq!(
-            super::entity_sound_state(2, player, None, &tracked, None)
-                .filter(|s| !s.silent)
-                .map(|s| s.position),
-            Some([0.5, 70.0, 0.5]),
-            "the local player is named by Remote.entity_id"
-        );
-        assert_eq!(
-            super::entity_sound_state(7, player, None, &tracked, None)
-                .filter(|s| !s.silent)
-                .map(|s| s.position),
-            Some([8.5, 64.0, -3.5]),
-            "another entity the server spawned"
-        );
-        assert_eq!(
-            super::entity_sound_state(9, player, None, &tracked, None)
-                .filter(|s| !s.silent)
-                .map(|s| s.position),
-            None,
-            "getEntity is null: handleSoundEntityEvent returns"
-        );
-        assert_eq!(
-            super::entity_sound_state(2, None, None, &tracked, None)
-                .filter(|s| !s.silent)
-                .map(|s| s.position),
-            None,
-            "a player with no position yet"
-        );
-    }
-    #[test]
-    fn a_sound_entity_retains_silence_for_players_and_non_mob_targets() {
-        use std::collections::HashMap;
-        let mut tracked = HashMap::new();
-        tracked.insert(
-            7,
-            super::Tracked {
-                kind: "minecraft:arrow".to_owned(),
-                position: [8.5, 64.0, -3.5],
-                codec_base: [8.5, 64.0, -3.5],
-                silent: true,
-                vehicle: None,
-            },
-        );
-        let state = super::entity_sound_state(7, None, None, &tracked, None).unwrap();
-        assert!(state.silent);
-        assert!(!state.removed);
-        assert_eq!(state.position, [8.5, 64.0, -3.5]);
-        let player =
-            super::entity_sound_state(2, Some((2, [1.0, 2.0, 3.0], true)), None, &tracked, None)
-                .unwrap();
-        assert!(player.silent);
-        assert!(super::entity_sound_state(9, None, None, &tracked, None).is_none());
-    }
-    #[test]
-    fn a_dragon_sound_uses_live_movement_without_losing_mob_metadata() {
-        use horizon_client::sound_engine::SoundEntityState;
-        let stale = SoundEntityState {
-            position: [0.0, 64.0, 0.0],
-            silent: true,
-            removed: false,
-        };
-        let tracked = std::collections::HashMap::new();
-        for position in [[24.0, 80.0, -16.0], [25.5, 81.0, -18.0]] {
-            let state =
-                super::entity_sound_state(7, None, Some(stale), &tracked, Some((7, position)))
-                    .unwrap();
-            assert_eq!(state.position, position);
-            assert!(state.silent);
-            assert!(!state.removed);
-        }
-        let unrelated =
-            super::entity_sound_state(7, None, Some(stale), &tracked, Some((8, [99.0; 3])))
-                .unwrap();
-        assert_eq!(unrelated.position, stale.position);
-        assert!(super::entity_sound_state(7, None, None, &tracked, Some((7, [99.0; 3]))).is_none());
-    }
-
-    /// Q over a slot of the inventory on a server (#3357): the predicted THROW
-    /// drops the stack, so the player's hand swings, as `LivingEntity.drop`
-    /// does for `Prediction.PREDICTED`; a plain pick up drops nothing.
-    #[test]
-    fn a_predicted_throw_from_a_slot_swings_the_hand() {
-        use horizon_client::{
-            banner::Banners,
-            brewing::Brewing,
-            crafting::Recipes,
-            creative::Names,
-            enchant::Enchantments,
-            items::{ItemStack, Items},
-            menu::{Env, Input, Kind, Menu},
-            stations::StationRecipes,
-        };
-        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../../.local/horizon-client")
-            .join(horizon_core::VANILLA_VERSION);
-        if !root.join("items.json").exists() {
-            return;
-        }
-        let none = &horizon_world::loot::PackOverlay::NONE;
-        let defaults = horizon_world::item_defaults::read(&root).unwrap();
-        let items = Items::catalog(&root, none, &defaults).unwrap();
-        let recipes = Recipes::load(&root, &items, none, &crate::game::test_server_load()).unwrap();
-        let brewing = Brewing::load(&root, &items, none);
-        let banners = Banners::load(&root, &defaults);
-        let station_recipes =
-            StationRecipes::load(&root, &items, none, &crate::game::test_server_load());
-        let enchantments = Enchantments::default();
-        let names = Names::default();
-        let env = Env {
-            crafting_remainder: None,
-            player: None,
-            player_entity_id: None,
-            loop_context: &crate::game::test_server_load()
-                .loop_context(horizon_world::native_load_context::LoopSide::Client, []),
-            items: &items,
-            recipes: &recipes,
-            brewing: &brewing,
-            banners: &banners,
-            station_recipes: &station_recipes,
-            enchantments: &enchantments,
-            names: &names,
-            trade: None,
-            maps: None,
-            limited_crafting: false,
-            known_recipes: None,
-        };
-        let mut menu = Menu::new(Kind::Inventory);
-        let cobblestone = ItemStack {
-            item: "minecraft:cobblestone".into(),
-            count: 16,
-            damage: 0,
-            extra: None,
-        };
-        // The first hotbar slot of InventoryMenu.
-        menu.set_slot(&env, 36, Some(cobblestone));
-        let (sent, threw) =
-            super::predict_clicks(&mut menu, &env, &[(36, 0, Input::Throw)]).unwrap();
-        assert!(threw, "Q over a slot drops one and swings");
-        assert_eq!(menu.slot(36).map(|s| s.count), Some(15));
-        assert_eq!(sent.len(), 1);
-        let (_, threw) = super::predict_clicks(&mut menu, &env, &[(36, 0, Input::Pickup)]).unwrap();
-        assert!(!threw, "picking the stack up drops nothing");
-        let (_, threw) =
-            super::predict_clicks(&mut menu, &env, &[(-999, 1, Input::Pickup)]).unwrap();
-        assert!(threw, "one of the carried stack outside the window");
-    }
-
-    #[test]
-    fn free_direction_sends_a_break_before_the_move_that_goes_into_its_space() {
-        use super::{Empty, S, play, waits_for_the_view};
-        let action = |action| {
-            S::PlayerAction(play::PlayerAction {
-                action,
-                pos: [0, 62, 0],
-                direction: 0,
-                sequence: 1,
-            })
-        };
-        // Start, change direction, abort and stop go at once right after a steered move.
-        for dig in 0..=3 {
-            assert!(
-                !waits_for_the_view(&action(dig), true, false),
-                "action {dig}"
-            );
-        }
-        // A drop (5, DROP_ITEM) and a use wait for a move with the view's look.
-        let used = S::UseItem(play::UseItem {
-            hand: 0,
-            sequence: 2,
-            yaw: 0.0,
-            pitch: 0.0,
-        });
-        assert!(waits_for_the_view(&action(5), true, false));
-        assert!(waits_for_the_view(&used, true, false));
-        assert!(!waits_for_the_view(&used, false, false));
-        // After something held everything waits, in order; a swing alone never does.
-        assert!(waits_for_the_view(&action(0), true, true));
-        assert!(waits_for_the_view(&S::Punch(Empty), false, true));
-        assert!(!waits_for_the_view(&S::Punch(Empty), true, false));
-    }
-
-    #[test]
-    fn placement_preview_checks_obstruction_without_changing_the_level() {
-        use super::DryLevel;
-        use horizon_core::{position::BlockPos, random::LegacyRandom};
-        use horizon_world::{
-            level::{
-                Behaviours, LevelAccess, PlaceContext, PlaceOutcome, Ticks, data::load_registry,
-            },
-            registry::BlockStateId,
-        };
-
-        struct Level {
-            air: BlockStateId,
-            stone: BlockStateId,
-            power: BlockStateId,
-            client_side: bool,
-            obstructed: bool,
-            loaded: bool,
-            ceiling: i32,
-        }
-        impl horizon_world::level::BlockEntityNeighbors for Level {}
-        impl LevelAccess for Level {
-            fn block_state(&self, pos: BlockPos) -> BlockStateId {
-                if pos == BlockPos::new(0, 0, 0) {
-                    self.stone
-                } else if pos == BlockPos::new(-1, 1, 0) {
-                    self.power
-                } else {
-                    self.air
-                }
-            }
-            fn set_raw(&mut self, _: BlockPos, _: BlockStateId) -> Option<BlockStateId> {
-                panic!("preview must not write to the live level");
-            }
-            fn is_loaded(&self, _: BlockPos) -> bool {
-                self.loaded
-            }
-            fn is_client_side(&self) -> bool {
-                self.client_side
-            }
-            fn max_y(&self) -> i32 {
-                self.ceiling
-            }
-            fn is_unobstructed(&self, pos: BlockPos, _: BlockStateId) -> bool {
-                assert_eq!(pos, BlockPos::new(0, 1, 0));
-                !self.obstructed
-            }
-            fn random(&mut self) -> &mut LegacyRandom {
-                panic!("preview must not advance the live level's random source");
-            }
-            fn game_time(&self) -> i64 {
-                0
-            }
-        }
-
-        // As with the LAN tests, prepared game resources are optional locally.
-        let resources = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../../.local/horizon-client")
-            .join(horizon_core::VANILLA_VERSION);
-        if !resources.join("block-behaviours.json").exists() {
-            return;
-        }
-        let registry = load_registry(&resources).unwrap();
-        let behaviours = Behaviours::load(&registry, &resources).unwrap();
-        let mut base = Level {
-            air: registry.default_state("minecraft:air").unwrap(),
-            stone: registry.default_state("minecraft:stone").unwrap(),
-            power: registry.default_state("minecraft:redstone_block").unwrap(),
-            client_side: true,
-            obstructed: false,
-            loaded: true,
-            ceiling: 320,
-        };
-        for item in [
-            "minecraft:stone",
-            "minecraft:oak_slab",
-            "minecraft:oak_door",
-            "minecraft:tnt",
-            "minecraft:piston",
-            "minecraft:sticky_piston",
-            // GrowingPlantHeadBlock.getStateForPlacement draws a random age.
-            "minecraft:twisting_vines",
-        ] {
-            let ctx = PlaceContext {
-                clicked_pos: BlockPos::new(0, 0, 0),
-                face: horizon_core::geometry::Direction::Up,
-                hit: horizon_core::geometry::Vec3::new(0.5, 1.0, 0.5),
-                inside: false,
-                yaw: 0.0,
-                pitch: 45.0,
-                sneaking: false,
-                item: item.into(),
-                can_use_game_master_blocks: false,
-            };
-            for (client_side, obstructed, loaded, ceiling) in [
-                (true, false, true, 320),
-                (true, true, true, 320),
-                (true, false, false, 320),
-                (true, false, true, 1),
-                (false, false, true, 320),
-            ] {
-                base.client_side = client_side;
-                base.obstructed = obstructed;
-                base.loaded = loaded;
-                base.ceiling = ceiling;
-                let valid = !obstructed && loaded && ceiling > 1;
-                let mut preview = DryLevel::new(&base);
-                let mut ticks = Ticks::default();
-                let outcome = behaviours.place_block(&mut preview, &mut ticks, &ctx);
-                assert_eq!(
-                    matches!(outcome, PlaceOutcome::Placed { .. }),
-                    valid,
-                    "{item}, obstructed={obstructed}, loaded={loaded}, ceiling={ceiling}"
-                );
-                assert_eq!(preview.changed.is_empty(), !valid);
-                if valid
-                    && matches!(
-                        item,
-                        "minecraft:tnt" | "minecraft:piston" | "minecraft:sticky_piston"
-                    )
-                {
-                    assert_eq!(
-                        registry
-                            .state(preview.block_state(BlockPos::new(0, 1, 0)))
-                            .unwrap()
-                            .name,
-                        if item == "minecraft:tnt" && !client_side {
-                            "minecraft:air"
-                        } else {
-                            item
-                        },
-                        "powered {item}, client_side={client_side}"
-                    );
-                    assert_eq!(
-                        ticks.block_events.is_empty(),
-                        client_side || item == "minecraft:tnt",
-                        "only the server starts a powered piston"
-                    );
-                }
-                assert_eq!(base.block_state(BlockPos::new(0, 1, 0)), base.air);
-            }
-        }
-    }
-
-    #[test]
-    fn the_creative_sync_covers_inventory_menu_slots_5_to_45_once_each() {
-        // CreativeInventoryListener sends every InventoryMenu slot but the crafting ones: the
-        // armour (5..=8), the inventory (9..=44) and the off hand (45).
-        let stack = |item: &str| Some(horizon_client::items::ItemStack::new(item, 1));
-        let inventory: Vec<_> = (0..36)
-            .map(|i| stack(&format!("minecraft:item_{i}")))
-            .collect();
-        let offhand = stack("minecraft:shield");
-        let armor = [
-            stack("minecraft:diamond_helmet"),
-            stack("minecraft:diamond_chestplate"),
-            stack("minecraft:diamond_leggings"),
-            stack("minecraft:diamond_boots"),
-        ];
-        let stacks = super::creative_sync_stacks(&inventory, &offhand, &armor);
-        assert_eq!(stacks.len(), super::CREATIVE_SYNCED);
-        let mut slots: Vec<i16> = (0..stacks.len()).map(super::creative_sync_slot).collect();
-        // Each entry goes to the menu slot that holds that stack.
-        for (i, &slot) in slots.iter().enumerate() {
-            let game_slot = Game::inventory_screen_slot("inventory", i32::from(slot)).unwrap();
-            let expected = match game_slot {
-                0..36 => &inventory[game_slot],
-                504 => &offhand,
-                500..504 => &armor[game_slot - 500],
-                _ => panic!("entry {i} went to game slot {game_slot}"),
-            };
-            assert_eq!(&stacks[i], expected, "entry {i}, menu slot {slot}");
-        }
-        slots.sort();
-        assert_eq!(slots, (5..=45).collect::<Vec<i16>>());
-    }
-
-    #[test]
-    fn a_server_slot_update_leaves_an_unsent_creative_click_to_be_sent() {
-        let stack = |item: &str| Some(horizon_client::items::ItemStack::new(item, 1));
-        let none = || vec![None; super::CREATIVE_SYNCED];
-        // Synced: nothing. A click puts a helmet on (entry 37, not sent yet), then the server
-        // sets hotbar slot 0 (a pickup): only that entry counts as synced.
-        let mut synced = none();
-        let mut before = none();
-        before[37] = stack("minecraft:diamond_helmet");
-        let mut now = before.clone();
-        now[0] = stack("minecraft:stick");
-        super::mark_synced(&mut synced, &before, now.clone());
-        assert_eq!(synced[0], now[0]);
-        assert_eq!(
-            synced[37], None,
-            "the helmet still differs, so the next tick sends it"
-        );
-    }
-
-    #[test]
-    fn every_inventory_menu_slot_is_a_game_slot_and_45_is_the_off_hand() {
-        // InventoryMenu: result, 2x2 grid, armour, 27 + 9 inventory slots, then the off hand.
-        assert_eq!(Game::inventory_screen_slot("inventory", 45), Some(504));
-        let mut seen = std::collections::HashSet::new();
-        for slot in 0..46 {
-            let internal = Game::inventory_screen_slot("inventory", slot);
-            assert!(internal.is_some_and(|i| seen.insert(i)), "slot {slot}");
-        }
-        assert_eq!(Game::inventory_screen_slot("inventory", 46), None);
-    }
-
-    #[test]
-    fn remote_clicks_find_slots_past_the_old_large_chest_cutoff() {
-        for (menu, internal, index) in [
-            ("minecraft:generic_9x6", 18, 63),
-            ("minecraft:generic_9x6", 19, 64),
-            ("minecraft:generic_9x6", 0, 81),
-            ("minecraft:generic_9x6", 8, 89),
-            ("minecraft:generic_9x6", 353, 53),
-            ("minecraft:generic_9x5", 8, 80),
-            ("minecraft:generic_9x4", 8, 71),
-            ("minecraft:generic_9x3", 8, 62),
-            ("inventory", 504, 45),
-        ] {
-            assert_eq!(
-                Game::menu_slot_index(menu, internal),
-                Some(index),
-                "{menu}, game slot {internal}"
-            );
-        }
-        assert_eq!(Game::menu_slot_index("minecraft:generic_9x6", 354), None);
-        assert_eq!(Game::menu_slot_index("minecraft:generic_9x6", 504), None);
-        assert_eq!(Game::menu_slot_index("unknown", 0), None);
-    }
-
-    /// `FireworkRocketItem.use` is SUCCESS while gliding: the main hand's
-    /// rocket ends the click and the off hand's shield is not raised (#3424).
-    /// On foot it passes, so the off hand still gets its turn.
-    #[test]
-    fn a_rocket_used_while_gliding_ends_the_click() {
-        let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("../../.local/horizon-client")
-            .join(horizon_core::VANILLA_VERSION);
-        if !root.join("items.json").exists() {
-            eprintln!("skipping: no prepared resources in {}", root.display());
-            return;
-        }
-        let registry = horizon_world::level::data::load_registry(&root).unwrap();
-        let facts = horizon_client::blocks::BlockFacts::load(&root, &registry).unwrap();
-        let defaults = horizon_world::item_defaults::read(&root).unwrap();
-        let items = horizon_client::items::Items::load(
-            &root,
-            &registry,
-            &facts,
-            &horizon_world::loot::PackOverlay::NONE,
-            &defaults,
-        )
-        .unwrap();
-        let rocket = items.get("minecraft:firework_rocket").unwrap();
-        assert!(super::use_ends_click(rocket, true), "gliding");
-        assert!(!super::use_ends_click(rocket, false), "on foot");
-        // Other items answer the same whether or not the player glides.
-        let shield = items.get("minecraft:shield").unwrap();
-        let stick = items.get("minecraft:stick").unwrap();
-        for gliding in [false, true] {
-            assert!(super::use_ends_click(shield, gliding));
-            assert!(!super::use_ends_click(stick, gliding));
-            // FoodOnAStickItem.use passes on a client: no swing while the boost cools down.
-            for rod in [
-                "minecraft:carrot_on_a_stick",
-                "minecraft:warped_fungus_on_a_stick",
-            ] {
-                let rod = items.get(rod).unwrap();
-                assert!(!super::use_ends_click(rod, gliding), "{}", rod.id);
-            }
-        }
-    }
-
-    /// `ClientPacketListener.handleGameEvent`: verify that the game event packet
-    /// types for arrow hit, pufferfish sting and limited crafting match vanilla.
-    #[test]
-    fn game_event_constants_and_types_match_vanilla() {
-        use horizon_protocol::packets::play::GameEvent;
-        // Event types from ClientboundGameEventPacket:
-        // 6 = PLAY_ARROW_HIT_SOUND, 7 = RAIN_LEVEL_CHANGE, 8 = THUNDER_LEVEL_CHANGE,
-        // 9 = PUFFER_FISH_STING, 11 = IMMEDIATE_RESPAWN, 12 = LIMITED_CRAFTING.
-        let arrow = GameEvent {
-            event: 6,
-            param: 0.0,
-        };
-        let rain = GameEvent {
-            event: 7,
-            param: 0.5,
-        };
-        let thunder = GameEvent {
-            event: 8,
-            param: 0.2,
-        };
-        let puffer = GameEvent {
-            event: 9,
-            param: 0.0,
-        };
-        let respawn = GameEvent {
-            event: 11,
-            param: 1.0,
-        };
-        let crafting = GameEvent {
-            event: 12,
-            param: 1.0,
-        };
-
-        assert_eq!(arrow.event, 6);
-        assert_eq!(rain.event, 7);
-        assert_eq!(thunder.event, 8);
-        assert_eq!(puffer.event, 9);
-        assert_eq!(respawn.event, 11);
-        assert_eq!(crafting.event, 12);
-        assert!(crafting.param == 1.0);
-    }
-}
-
-#[cfg(test)]
-#[path = "player_tick_tests.rs"]
-mod player_tick_tests;
-
-/// Whether a synchronized dimension type's values are inside the codec's ranges
-/// (`DimensionType.java`: a coordinate scale of `1.0E-5F` to `3.0E7`, a monster spawn block light
-/// limit of 0 to 15; the ambient light has no range), so a portal's ratio of two scales is finite.
-fn sane_facts(facts: &horizon_world::dimension_type::DimensionFacts) -> bool {
-    (f64::from(1.0e-5_f32)..=3.0e7).contains(&facts.coordinate_scale)
-        && (0..=15).contains(&facts.monster_spawn_block_light_limit)
-        && facts.ambient_light.is_finite()
-}
-
-#[cfg(test)]
-mod level_facts_tests {
-    use super::sane_facts;
-    use horizon_world::dimension_type::DimensionFacts;
-
-    /// A type outside the codec's ranges is not taken; the vanilla ones are.
-    #[test]
-    fn a_type_outside_the_codecs_ranges_is_refused() {
-        let mut facts = DimensionFacts::overworld().clone();
-        assert!(sane_facts(&facts));
-        assert!(sane_facts(DimensionFacts::of_builtin_level(
-            horizon_core::LevelKey::NETHER
-        )));
-        for scale in [0.0, f64::from_bits(1), -1.0, 3.1e7, f64::NAN] {
-            facts.coordinate_scale = scale;
-            assert!(!sane_facts(&facts), "{scale}");
-        }
-        facts.coordinate_scale = 1.0;
-        // the codec sets no range on the ambient light
-        facts.ambient_light = 1.5;
-        assert!(sane_facts(&facts));
-        facts.monster_spawn_block_light_limit = 16;
-        assert!(!sane_facts(&facts));
-    }
-}
+                .replace_remote(&mut gameXÚYHØ[Y\˜JØ[YJK[Ü˜\
+
+NÂˆØ[YKš[™WÜXÚÙ]
+Î”™[[İ™Q[]Y\Ê^N”™[[İ™Q[]Y\ÈÈYÎˆ™XÈVÎNWHJJBˆ[Ü˜\
+
+NÂˆ\ÜÙ\Ù\HJØ[Y\˜JØ[YJKÛÛYJ]XÚY
+JNÂˆ\ÜÙ\Ù\HJ]XÚYšY
+
+KÌJNÂˆ\ÜÙ\Ù\HJ]XÚYœÜÚ][ÛŠØ[YJKÛÛYJÌLŒŒL‹ŒJJNÂˆØ[YKš[™WÜXÚÙ]
+Î”Ù]Ø[Y\˜J^N”Ù]Ø[Y\˜HÈØ[Y\˜WÚYˆNHJJBˆ[Ü˜\
+
+NÂˆ\ÜÙ\Ù\HJˆØ[Y\˜JØ[YJKˆÛÛYJ]XÚY
+Kˆ[šÛ›İÛˆXÚÙ]\™Ù]È\™HYÛ›Ü™Y‚ˆ
+NÂˆØ[YKš[™WÜXÚÙ]
+Î”™[[İ™Q[]Y\Ê^N”™[[İ™Q[]Y\ÈÈYÎˆ™XÈVÌÌWHJJBˆ[Ü˜\
+
+NÂˆ\ÜÙ\Ù\HJØ[Y\˜JØ[YJKÛÛYJØØ[
+JNÂˆ\ÜÙ\JˆØ[YK˜ÛÛ›Û×ØØ[Y\˜J
+Kˆ›[İ™[Y[[œ][™ÜÚ][ÛˆXÚÙ]È\™H[˜X›Y‚ˆ
+NÂˆ\ÜÙ\JYØ[YKšY\×Ø\×ØØ[Y\˜JÌJJNÂˆ\ÜÙ\JØ[YKœÜXİ]YÜÜİÙY™™Xİš\×Û›Û™J
+JNÂˆØ[YKš[™WÜXÚÙ]
+Î”Ù]Ø[Y\˜J^N”Ù]Ø[Y\˜HÈØ[Y\˜WÚYˆÈJJBˆ[Ü˜\
+
+NÂˆ\ÜÙ\Ù\HJØ[Y\˜JØ[YJKÛÛYJØØ[
+JNÂ‚ˆØ[YK]HHÛÛYJ]N›™]ÊØ[YKœØ]™Kœ›Ûİ˜ÛÛ™J
+K	™Ø[YK›Ü[ÛœËœ™\Ûİ\˜Ù\ÊJNÂˆ\ÜÙ\JˆØ[Y\˜JØ[YJKš\×Û›Û™J
+KˆH]HØÜ™Y[ˆ\È›ÈØ[Y\˜H[]H‚ˆ
+NÂˆØ[YK]HH›Û™NÂˆ\ÜÙ\Ù\HJØ[Y\˜JØ[YJKÛÛYJØØ[
+JNÂ‚ˆÜ]Û‹™[Y[œÚ[ÛˆH\İ›İ\—Ûİ™\ÛÜ›‹š[Ê
+NÂˆØ[YKš[™WÜXÚÙ]
+Î”™\Ü]ÛŠ^N”™\Ü]ÛˆÈÜ]Û‹ÙY\ˆJJBˆ[Ü˜\
+
+NÂˆ\ÜÙ\JˆØ[Y\˜JØ[YJKš\×Û›Û™J
+Kˆœ™\XÙ[Y[ØZ]È›Üˆ]È™]È^Y\ˆ‚ˆ
+NÂˆØ[YKœ^Y\ˆHÛÛYJ^Y\“[İ[Û›™]ÊØ[YK›[İ[Û‹™XÌÎ–‘T“ÊK[Ü˜\
+
+JNÂˆ]œ™\ÚHØ[Y\˜JØ[YJK[Ü˜\
+
+NÂˆ\ÜÙ\Ù\HJœ™\ÚšY
+
+KØØ[šY
+
+JNÂˆ\ÜÙ\Û™HJœ™\Ú™\ØÚ
+
+KØØ[™\ØÚ
+
+JNÂˆ\ÜÙ\Ù\HJØØ[œÜÚ][ÛŠØ[YJK›Û™K›Û]™[[™\Èİ^Hİ[HŠNÂˆ\ÜÙ\Ù\HJœ™\ÚœÜÚ][ÛŠØ[YJKÛÛYJÌŒÈ×JJNÂˆØ[YK˜ÛY[ÛÙÙÚ[™×Ûİ]
+
+NÂˆ\ÜÙ\JØ[Y\˜JØ[YJKš\×Û›Û™J
+JNÂˆ\ÜÙ\Ù\HJœ™\ÚœÜÚ][ÛŠØ[YJK›Û™JNÂˆJNÂˆB‚ˆËËÈHØØ[^Y\‰ÜÈİÛˆİ]H™XYÈ[œİÙ\ˆÛˆHÛY[œ›ÛHÚ]BˆËËÈÙ\™\ˆÙ[]
+ØØ[^Y\˜
+NÈ[›İ\ˆ^Y\ˆ™XYÈ›Û™H\™K‚ˆÖİ\İBˆÖÚYÛ›Ü™HH›™YYÈ™\\™Y™\Ûİ\˜Ù\È[ˆÔ’V“Ó—ÕTÕÔ‘TÓÕTÑTÈ—Bˆ›ˆÛY[Ü^Y\—Ü™XY×Ø[œİÙ\—Ùœ›ÛWİWÛØØ[Ü^Y\œ×ØÛÜJ
+HÂˆ\ÙHİ\\œİ\\Ù^Xİ][Û—Ü›ÛN‘^Xİ][Û”›ÛK˜]]™WÙ[]WÜ™YœÎ\İÎÚ]ÙØ[Y_NÂˆ\ÙHÜš^›Û—ØÛY[Û]™[ÛØY[™Î”™X\ÛÛ‹[İ[Û”^Y\“[İ[ÛŸNÂˆ\ÙHÜš^›Û—ØÛÜ™N™Ù[ÛY]N•™XÌÎÂˆ\ÙHÜš^›Û—Ü›İØÛÛÂˆÛÛ›™Xİ[Û”\KˆXÚÙ]Îœ^NÜÙ[‹ÛY[›İ[™\ÈËÜ]Û’[™›ßKˆNÂˆ\ÙH[ÙØ\NÑ[]T™Y‹Ø[YS[Ù_NÂ‚ˆÚ]ÙØ[YJØ[Y_ÂˆØ[YK›Ü[ÛœË™^Xİ][Û—Ü›ÛHH^Xİ][Û”›ÛNÛY[Âˆ]
+ÛY[ÜÙ\™\ŠHH\NœZ\Š
+NÂˆØ[YK˜ÛÛ›™XİÛØØ[
+ÛY[”^Y\”™XY\İŠK[Ü˜\
+
+NÂˆ]Ü]ÛˆHÜ]Û’[™›ÈÂˆ[Y[œÚ[Û—İ\Nˆˆ[Y[œÚ[Ûˆ›Z[™XÜ˜Y›İ™\ÛÜ›‹š[Ê
+KˆÙYYˆˆØ[YWİ\Nˆˆ™]š[İ\×ÙØ[YWİ\Nˆ›Û™KˆXYÎˆ˜[ÙKˆ›]ˆYKˆ\İÙX]ˆ›Û™KˆÜ[ØÛÛÛİÛˆˆÙXWÛ]™[ˆŒËˆNÂˆØ[YK™[\—Ü™[[İWÙ[Y[œÚ[ÛŠ	œÜ]Û‹˜[ÙK™X\ÛÛ“İ\ŠNÂˆ]™[[İHHØ[YKœ™[[İK˜\×Û]]
+
+K[Ü˜\
+
+NÂˆ™[[İK›ÙÙÙYÚ[ˆHYNÂˆ™[[İK™[]WÚYHÎÂˆ™[[İKœ›Ùš[HHÂˆØ[YKœ^Y\ˆHÛÛYJ^Y\“[İ[Û›™]ÊØ[YK›[İ[Û‹™XÌÎ›™]ÊKKŒJJK[Ü˜\
+
+JNÂˆ]^Y\ˆHØ[YK›ØØ[Ü^Y\Š
+K[Ü˜\
+
+NÂ‚ˆËÈİ\š]˜[\ÈHÙÚ[ˆXÚÙ]Y]ˆZ[[™È[İÙY›È›YÚ‚ˆ\ÜÙ\Ù\HJ^Y\‹™Ø[YWÛ[ÙJØ[YJKÛÛYJØ[YS[ÙN”İ\š]˜[
+JNÂˆ\ÜÙ\Ù\HJ^Y\‹›X^WØZ[
+Ø[YJKÛÛYJYJJNÂˆ\ÜÙ\Ù\HJ^Y\‹˜Xš[]Y\ÊØ[YJK›X\
+_K›X^WÙ›JKÛÛYJ˜[ÙJJNÂ‚ˆËÈÒS‘ÑWÑĞSQWÓSÑHÈY™[\™Nˆ›ÈZ[[™ÎÈ[ˆHXš[]Y\ÈXÚÙ]‚ˆØ[YKš[™WÜXÚÙ]
+Î‘Ø[YQ]™[
+^N‘Ø[YQ]™[Âˆ]™[ˆËˆ\˜[Nˆ‹ŒˆJJBˆ[Ü˜\
+
+NÂˆ\ÜÙ\Ù\HJ^Y\‹™Ø[YWÛ[ÙJØ[YJKÛÛYJØ[YS[ÙNY™[\™JJNÂˆ\ÜÙ\Ù\HJ^Y\‹š\×ØÜ™X]]™JØ[YJKÛÛYJ˜[ÙJJNÂˆ\ÜÙ\Ù\HJ^Y\‹š\×ÜÜXİ]ÜŠØ[YJKÛÛYJ˜[ÙJJNÂˆ\ÜÙ\Ù\HJ^Y\‹›X^WØZ[
+Ø[YJKÛÛYJ˜[ÙJJNÂˆØ[YKš[™WÜXÚÙ]
+Î”^Y\Xš[]Y\Ê^N”^Y\Xš[]Y\ÈÂˆ›YÜÎˆ‹ˆ›Z[™×ÜÜYYˆŒKˆØ[Ú[™×ÜÜYYˆŒ‹ˆJJBˆ[Ü˜\
+
+NÂˆ]Xš[]Y\ÈH^Y\‹˜Xš[]Y\ÊØ[YJK[Ü˜\
+
+NÂˆ\ÜÙ\JXš[]Y\Ë›X^WÙ›H	‰ˆXš[]Y\Ë™›Z[™È	‰ˆXXš[]Y\Ëš[[™\˜X›JNÂˆ\ÜÙ\JXXš[]Y\Ë›X^WØZ[
+NÂˆ\ÜÙ\Ù\HJ
+Xš[]Y\Ë™›WÜÜYYXš[]Y\ËØ[×ÜÜYY
+K
+ŒKŒŠJNÂ‚ˆËÈ›ÛÙœ›ÛHÙ]X[ÈHÛY[ÙY\È›È^]\İ[Û‹‚ˆØ[YKš[™WÜXÚÙ]
+Î”Ù]X[
+^N”Ù]X[ÂˆX[ˆŒŒˆ›ÛÙˆKˆØ]\˜][ÛˆKKˆJJBˆ[Ü˜\
+
+NÂˆ]›ÛÙH^Y\‹™›ÛÙ
+Ø[YJK[Ü˜\
+
+NÂˆ\ÜÙ\Ù\HJˆ
+›ÛÙ›]™[›ÛÙœØ]\˜][Û‹›ÛÙ™^]\İ[ÛŠKˆ
+KKKŒ
+Bˆ
+NÂˆ\ÜÙ\Ù\HJ^Y\‹›™YY×Ù›ÛÙ
+Ø[YJKÛÛYJYJJNÂˆ\ÜÙ\Ù\HJ^Y\‹š\×Ù[›İYÚÙ›ÛÙ
+Ø[YJKÛÛYJ˜[ÙJJNÂ‚ˆËÈHİ˜\ˆÛİ[™H^\šY[˜ÙHHÙ\™\ˆÙ]‚ˆØ[YKš[™WÜXÚÙ]
+Î”Ù][Ûİ
+^N”Ù][ÛİÈÛİˆJJBˆ[Ü˜\
+
+NÂˆ\ÜÙ\Ù\HJ^Y\‹œÙ[XİYÜÛİ
+Ø[YJKÛÛYJ
+JNÂˆØ[YKš[™WÜXÚÙ]
+Î”Ù]^\šY[˜ÙJ^N”Ù]^\šY[˜ÙHÂˆ›ÙÜ™\ÜÎˆŒKˆ]™[ˆËˆİ[ˆÌˆJJBˆ[Ü˜\
+
+NÂˆ]H^Y\‹™^\šY[˜ÙJØ[YJK[Ü˜\
+
+NÂˆ\ÜÙ\Ù\HJ
+›]™[œ›ÙÜ™\ÜËİ[
+K
+ËŒKÌ
+JNÂˆ\ÜÙ\Ù\HJ^Y\‹Û™YYYÙ›Ü—Û™^Û]™[
+Ø[YJKÛÛYJLÊJNÂ‚ˆËÈHXZ[ˆ[™[ÜH™]Z[œÈ\YİXÚÜÈ[™Z\ˆ[XYÙK[ˆÛİÜ™\‹‚ˆ]]]İXÚÈHÜš^›Û—ØÛY[š][\Î’][TİXÚÎ›™]Ê›Z[™XÜ˜Y™X[[Û™ÜXÚØ^H‹JNÂˆİXÚË™[XYÙHHÎÂˆØ[YKš[™[ÜK™š[
+›Û™JNÂˆØ[YKš[™[ÜVÌ×HHÛÛYJİXÚË˜ÛÛ™J
+JNÂˆØ[YKš[™[ÜVÎHHÛÛYJÜš^›Û—ØÛY[š][\Î’][TİXÚÎ›™]Ê›Z[™XÜ˜YœİÛ™H‹LŠJNÂˆ\ÜÙ\Ù\HJˆ^Y\‹š[™[ÜJØ[YJKˆÛÛYJˆ™XÈVÂˆİXÚËˆÜš^›Û—ØÛY[š][\Î’][TİXÚÎ›™]Ê›Z[™XÜ˜YœİÛ™H‹LŠBˆBˆWÚ[×Ø\J
+Bˆ[Ü˜\
+
+Bˆ
+Bˆ
+NÂ‚ˆËÈ[›İ\ˆ^Y\ˆHÛY[\Û‰İÙ[Z\ˆİ]K‚ˆ]\ØÚH^Y\‹™[]J
+K™\ØÚ
+
+NÂˆ]İ\ˆH[ÙØ\N—×Üš]˜]N™Ø[YNœ^Y\—Ü™YŠ[]T™Y›™]Ê\ØÚ
+KÊNÂˆ\ÜÙ\Ù\HJİ\‹™Ø[YWÛ[ÙJØ[YJK›Û™JNÂˆ\ÜÙ\Ù\HJİ\‹™›ÛÙ
+Ø[YJK›Û™JNÂˆ\ÜÙ\Ù\HJİ\‹œÙ[XİYÜÛİ
+Ø[YJK›Û™JNÂˆ\ÜÙ\Ù\HJİ\‹š[™[ÜJØ[YJK›Û™JNÂˆJNÂˆB‚ˆÖİ\İBˆÖÚYÛ›Ü™HH›™YYÈ™\\™Y™\Ûİ\˜Ù\È[ˆÔ’V“Ó—ÕTÕÔ‘TÓÕTÑTÈ—Bˆ›ˆÛY[Ù\ØÚ×Ù›Ûİ×Û]™[Ü™\XÙ[Y[Ø[™ÛÙÛİ]
+
+HÂˆ\ÙHİ\\œİ\\Âˆ^Xİ][Û—Ü›ÛN‘^Xİ][Û”›ÛK˜]]™WÙ[]WÜ™YœÎ\İÎÚ]ÙØ[YKˆ˜]]™WÛY™XŞXÛN“˜]]™SY™XŞXÛKˆNÂˆ\ÙHÜš^›Û—ØÛY[Û]™[ÛØY[™Î”™X\ÛÛ‹[ØœÎ“[Ø‹[İ[Û”^Y\“[İ[ÛŸNÂˆ\ÙHÜš^›Û—ØÛÜ™N™Ù[ÛY]N•™XÌÎÂˆ\ÙHÜš^›Û—Ü›İØÛÛÂˆÛÛ›™Xİ[Û”\KˆXÚÙ]Îœ^NĞÛY[›İ[™™\Ü]Û‹Ü]Û’[™›ßKˆNÂˆ\ÙH[ÙØ\NĞÜ›ÜÜÚZ\•\™Ù][]T™YŸNÂ‚ˆÚ]ÙØ[YJØ[Y_ÂˆØ[YK›Ü[ÛœË™^Xİ][Û—Ü›ÛHH^Xİ][Û”›ÛNÛY[ÂˆØ[YK›˜]]™WÛY™XŞXÛHH˜]]™SY™XŞXÛN™Y˜][
+
+NÂˆ]
+ÛY[ÜÙ\™\ŠHH\NœZ\Š
+NÂˆØ[YK˜ÛÛ›™XİÛØØ[
+ÛY[‘\ØÚ\İŠK[Ü˜\
+
+NÂˆËÈH˜[œÜÜ[Û™H\È›ÈÛY[]™[Y]‚ˆ\ÜÙ\JØ[YK›˜]]™WÛY™XŞXÛK™\ØÚ
+
+Kš\×Û›Û™J
+JNÂˆ]]]Ü]ÛˆHÜ]Û’[™›ÈÂˆ[Y[œÚ[Û—İ\Nˆˆ[Y[œÚ[Ûˆ›Z[™XÜ˜Y›İ™\ÛÜ›‹š[Ê
+KˆÙYYˆˆØ[YWİ\NˆKˆ™]š[İ\×ÙØ[YWİ\Nˆ›Û™KˆXYÎˆ˜[ÙKˆ›]ˆYKˆ\İÙX]ˆ›Û™KˆÜ[ØÛÛÛİÛˆˆÙXWÛ]™[ˆŒËˆNÂˆØ[YK™[\—Ü™[[İWÙ[Y[œÚ[ÛŠ	œÜ]Û‹˜[ÙK™X\ÛÛ“İ\ŠNÂˆ]›Ú[™YHØ[YK›˜]]™WÛY™XŞXÛK™\ØÚ
+
+K[Ü˜\
+
+NÂˆ]ÛH[]T™Y›™]Ê›Ú[™YLŠNÂˆ]™[[İHHØ[YKœ™[[İK˜\×Û]]
+
+K[Ü˜\
+
+NÂˆ™[[İK›Y[KœÙ]
+ÛÛYJ
+Ë›Z[™XÜ˜Y™Ù[™\šX×Î^È‹š[Ê
+JJJNÂˆ]Ü[—ÙÙ[™\˜][ÛˆH™[[İK›Y[K™Ù[™\˜][ÛÂˆØ[YKš[™WÜXÚÙ]
+ÛY[›İ[™”™\Ü]ÛŠ™\Ü]ÛˆÂˆÜ]ÛˆÜ]Û‹˜ÛÛ™J
+KˆÙY\ˆˆJJBˆ[Ü˜\
+
+NÂˆ\ÜÙ\Ù\HJØ[YK›˜]]™WÛY™XŞXÛK™\ØÚ
+
+KÛÛYJ›Ú[™Y
+JNÂˆ]™[[İHHØ[YKœ™[[İK˜\×Û]]
+
+K[Ü˜\
+
+NÂˆ\ÜÙ\J™[[İK›Y[K˜\×Ü™YŠ
+Kš\×Û›Û™J
+JNÂˆ\ÜÙ\Û™HJ™[[İK›Y[K™Ù[™\˜][Û‹Ü[—ÙÙ[™\˜][ÛŠNÂˆ][™[ÜWÙÙ[™\˜][ÛˆH™[[İK›Y[K™Ù[™\˜][ÛÂˆØ[YKš[™WÜXÚÙ]
+ÛY[›İ[™”™\Ü]ÛŠ™\Ü]ÛˆÂˆÜ]ÛˆÜ]Û‹˜ÛÛ™J
+KˆÙY\ˆˆJJBˆ[Ü˜\
+
+NÂˆ\ÜÙ\Ù\HJØ[YK›˜]]™WÛY™XŞXÛK™\ØÚ
+
+KÛÛYJ›Ú[™Y
+JNÂˆ]™[[İHHØ[YKœ™[[İK˜\×Û]]
+
+K[Ü˜\
+
+NÂˆ\ÜÙ\J™[[İK›Y[K˜\×Ü™YŠ
+Kš\×Û›Û™J
+JNÂˆ\ÜÙ\Û™HJ™[[İK›Y[K™Ù[™\˜][Û‹[™[ÜWÙÙ[™\˜][ÛŠNÂˆ™[[İK›Y[KœÙ]
+ÛÛYJ
+Ë›Z[™XÜ˜Y™Ù[™\šX×Î^È‹š[Ê
+JJJNÂˆ\ÜÙ\Û™HJ™[[İK›Y[K™Ù[™\˜][Û‹Ü[—ÙÙ[™\˜][ÛŠNÂˆ\ÜÙ\Û™HJ™[[İK›Y[K™Ù[™\˜][Û‹[™[ÜWÙÙ[™\˜][ÛŠNÂ‚ˆËÈHY™™\™[]™[Ù^H™\XÙ\ÈHÛÜ›]™[ˆÚ]HØ[YBˆËÈ[Y[œÚ[Ûˆ\NÈQÈØ[ˆ™H™]\ÙY]Û[™\ÈØ[››İ‚ˆÜ]Û‹™[Y[œÚ[ÛˆH\İ›İ\—Ûİ™\ÛÜ›‹š[Ê
+NÂˆØ[YK™[\—Ü™[[İWÙ[Y[œÚ[ÛŠ	œÜ]Û‹YK™X\ÛÛ“İ\ŠNÂˆ]™\XÙYHØ[YK›˜]]™WÛY™XŞXÛK™\ØÚ
+
+K[Ü˜\
+
+NÂˆ\ÜÙ\Û™HJ™\XÙY›Ú[™Y
+NÂˆ]İ\œ™[H[]T™Y›™]Ê™\XÙYLŠNÂˆ]Ú[™HØ[YKœ™\Ë›[Ø—İ\\Ê
+K™Ù]
+›Z[™XÜ˜YœYÈŠK[Ü˜\
+
+K˜ÛÛ™J
+NÂˆØ[YK›[ØœÂˆœ\Ú
+[Ø›™]ÊL‹Ú[™™XÌÎ›™]ÊŒKŒ‹Œ
+KŒ
+JNÂˆØ[YKœ^Y\ˆHÛÛYJ^Y\“[İ[Û›™]ÊØ[YK›[İ[Û‹™XÌÎ–‘T“ÊK[Ü˜\
+
+JNÂˆØ[YKX]ÈHŒÂˆØ[YKœ]ÚHŒÂˆ]ÛÛYJÜ›ÜÜÚZ\•\™Ù]‘[]HÈ[]K‹ˆJHHØ[YK˜Ü›ÜÜÚZ\—İ\™Ù]
+
+H[ÙHÂˆ[šXÈJHÜ›ÜÜÚZ\ˆ]ÈHYÈ[ˆœ›ÛÙˆH^Y\ˆŠNÂˆNÂˆ\ÜÙ\Ù\HJ[]Kİ\œ™[
+NÂˆ\ÜÙ\JˆØ[YK›˜]]™WÙ[]Wİ\™Ù]
+İ\œ™[
+Kš\×Û›Û™J
+Kˆœİ[Ù\™\‹[Û›H‚ˆ
+NÂˆËÈ\ÛÛ]HH^\İ[™È\ØÚÚXÚÈœ›ÛHHÙÚXØ[\Ù\™\ˆİX\™‚ˆØ[YK›Ü[ÛœË™^Xİ][Û—Ü›ÛHH^Xİ][Û”›ÛN’[YÜ˜]YÙ\™\Âˆ\ÜÙ\JØ[YK›˜]]™WÙ[]Wİ\™Ù]
+İ\œ™[
+Kš\×ÜÛÛYJ
+JNÂˆ\ÜÙ\JØ[YK›˜]]™WÙ[]Wİ\™Ù]
+Û
+Kš\×Û›Û™J
+JNÂˆØ[YK›Ü[ÛœË™^Xİ][Û—Ü›ÛHH^Xİ][Û”›ÛNÛY[Â‚ˆØ[YK˜ÛY[ÛÙÙÚ[™×Ûİ]
+
+NÂˆ\ÜÙ\JØ[YK›˜]]™WÛY™XŞXÛK™\ØÚ
+
+Kš\×Û›Û™J
+JNÂˆ\ÜÙ\JØ[YK˜Ü›ÜÜÚZ\—İ\™Ù]
+
+Kš\×Û›Û™J
+JNÂˆØ[YK˜ÛY[ÛÙÙÚ[™×Ûİ]
+
+NÂˆ\ÜÙ\JØ[YK›˜]]™WÛY™XŞXÛK™\ØÚ
+
+Kš\×Û›Û™J
+JNÂˆ]
+ÛY[ÜÙ\™\ŠHH\NœZ\Š
+NÂˆØ[YK˜ÛÛ›™XİÛØØ[
+ÛY[‘\ØÚ\İŠK[Ü˜\
+
+NÂˆ\ÜÙ\JØ[YK›˜]]™WÛY™XŞXÛK™\ØÚ
+
+Kš\×Û›Û™J
+JNÂˆØ[YK™[\—Ü™[[İWÙ[Y[œÚ[ÛŠ	œÜ]Û‹˜[ÙK™X\ÛÛ“İ\ŠNÂˆ\ÜÙ\Û™HJØ[YK›˜]]™WÛY™XŞXÛK™\ØÚ
+
+KÛÛYJ™\XÙY
+JNÂˆØ[YK˜ÛY[ÛÙÙÚ[™×Ûİ]
+
+NÂˆ\ÜÙ\JØ[YK›˜]]™WÛY™XŞXÛK™\ØÚ
+
+Kš\×Û›Û™J
+JNÂˆJNÂˆB‚ˆÖİ\İBˆÖÚYÛ›Ü™HH›™YYÈ™\\™Y™\Ûİ\˜Ù\È[ˆÔ’V“Ó—ÕTÕÔ‘TÓÕTÑTÈ—Bˆ›ˆÛÛ›™Xİ[Û—Ø[™Ù[Y[œÚ[Û—Ü™\XÙ[Y[ØÛX\—Ù]™\WÜ\XÛWÙÜ›İ\
+
+HÂˆ\ÙHİ\\œİ\\Âˆ^Xİ][Û—Ü›ÛN‘^Xİ][Û”›ÛK˜]]™WÙ[]WÜ™YœÎ\İÎÚ]ÙØ[YKˆ˜]]™WÚÛÚÜÎœ\XÛWØÛİ[İ\İÎ™š[ˆNÂˆ\ÙHÜš^›Û—ØÛY[›]™[ÛØY[™Î”™X\ÛÛÂˆ\ÙHÜš^›Û—Ü›İØÛÛØÛÛ›™Xİ[Û”\KXÚÙ]Îœ^N”Ü]Û’[™›ßNÂˆÚ]ÙØ[YJØ[Y_ÂˆØ[YK›Ü[ÛœË™^Xİ][Û—Ü›ÛHH^Xİ][Û”›ÛNÛY[Âˆš[
+Ø[YJNÂˆËÈ[˜ÛYH[™[™È\XÛ\È\ÈÙ[\È]™HÜ›İ\È™Y›Ü™H™\XÚ[™ÈHÛÛ›™Xİ[Û‹‚ˆØ[YKœ\XÛ\Ë™[\—ÙİX\™X[Š
+NÂˆ]
+ÛY[ÜÙ\™\ŠHH\NœZ\Š
+NÂˆØ[YK˜ÛÛ›™XİÛØØ[
+ÛY[”\XÛT™\Ù]ŠK[Ü˜\
+
+NÂˆ\ÜÙ\Ù\HJØ[YK˜ÛY[Ü\XÛWØÛİ[
+
+K
+NÂˆ\ÜÙ\JØ[YKœXÚİ\Ë›]™Kš\×Ù[\J
+JNÂˆØ[YKXÚ×Ü\XÛ\Ê
+NÂˆ\ÜÙ\Ù\HJØ[YK˜ÛY[Ü\XÛWØÛİ[
+
+K
+NÂˆ]Ü]ÛˆHÜ]Û’[™›ÈÂˆ[Y[œÚ[Û—İ\Nˆˆ[Y[œÚ[Ûˆ›Z[™XÜ˜Y›İ™\ÛÜ›‹š[Ê
+KˆÙYYˆˆØ[YWİ\NˆKˆ™]š[İ\×ÙØ[YWİ\Nˆ›Û™KˆXYÎˆ˜[ÙKˆ›]ˆYKˆ\İÙX]ˆ›Û™KˆÜ[ØÛÛÛİÛˆˆÙXWÛ]™[ˆŒËˆNÂˆš[
+Ø[YJNÂˆØ[YKœ\XÛ\Ë™[\—ÙİX\™X[Š
+NÂˆØ[YK™[\—Ü™[[İWÙ[Y[œÚ[ÛŠ	œÜ]Û‹˜[ÙK™X\ÛÛ“İ\ŠNÂˆ\ÜÙ\Ù\HJØ[YK˜ÛY[Ü\XÛWØÛİ[
+
+K
+NÂˆ\ÜÙ\JØ[YKœXÚİ\Ë›]™Kš\×Ù[\J
+JNÂˆØ[YKXÚ×Ü\XÛ\Ê
+NÂˆ\ÜÙ\Ù\HJˆØ[YK˜ÛY[Ü\XÛWØÛİ[
+
+Kˆˆœ[™[™ÈÜ›İ\ÈØ[››İ™]\›ˆ[ˆH™]È]™[‚ˆ
+NÂˆJNÂˆB‚ˆÖİ\İBˆÖÚYÛ›Ü™HH›™YYÈ™\\™Y™\Ûİ\˜Ù\È[ˆÔ’V“Ó—ÕTÕÔ‘TÓÕTÑTÈ—Bˆ›ˆ›Ü™Ù][™×Ø[™ØÛÜÚ[™×Ü™[[İWØÛÛ[[œ×ØÛX\—İZ\—Ù]J
+HÂˆ\ÙHİ\\œİ\\›˜]]™WÙ[]WÜ™YœÎ\İÎÚ]ÙØ[YNÂˆ\ÙHÜš^›Û—ØÛY[ØÚ[šÎÚ[šËÛÛZ[™\œÎ›ØÚÑ[]_NÂ‚ˆÚ]ÙØ[YJØ[Y_Âˆ›Üˆ[ˆ‹ŒˆÂˆØ[YKœİ™X[Z[™Âˆš[œÙ\Ü™[[İJ	›]]Ø[YKÛÜ›Ú[šÎ™[\J
+JNÂˆØ[YKÛÜ›ˆ˜›ØÚ×Ù[]Y\Âˆš[œÙ\
+
+
+ˆM‹
+K›ØÚÑ[]NÚ\İ
+™XÈV×JJNÂˆBˆËÈHØ[YK\ÜÚ][Ûˆ™\Ù[™™\XÙ\ÈH]HÚ]İ]™[[İš[™ÈHÛÛ[[‹‚ˆØ[YKœİ™X[Z[™Âˆœ™\XÙWÜ™[[İJ	›]]Ø[YKÛÜ›Ú[šÎ™[\J
+JNÂˆ\ÜÙ\Ù\HJØ[YKÛÜ›˜Ú[šÜË›[Š
+KŠNÂˆ\ÜÙ\JØ[YKÛÜ›˜Ú[šÜË˜ÛÛZ[œ×ÚÙ^J	Š
+JJNÂˆ\ÜÙ\JØ[YKœİ™X[Z[™Ëš\×Û]
+
+JNÂˆ]]]›Ü™Ûİ[ˆHÊ
+WKš[×Ú]\Š
+K˜ÛÛXİ
+
+NÂˆØ[YK™›Ü™Ù]Ü™[[İWØÛÛ[[œÊ	›]]›Ü™Ûİ[‹YJNÂˆ\ÜÙ\JYØ[YKÛÜ›˜Ú[šÜË˜ÛÛZ[œ×ÚÙ^J	Š
+JJNÂˆ\ÜÙ\JYØ[YKÛÜ›˜›ØÚ×Ù[]Y\Ë˜ÛÛZ[œ×ÚÙ^J	Š
+JJNÂˆ\ÜÙ\JYØ[YKœİ™X[Z[™Ëš\×Û]
+
+JNÂˆ\ÜÙ\JØ[YKÛÜ›˜Ú[šÜË˜ÛÛZ[œ×ÚÙ^J	ŠK
+JJNÂˆØ[YK™›Ü™Ù]Ü™[[İWØÛÛ[[œÊ	›]]Ê
+WKš[×Ú]\Š
+K˜ÛÛXİ
+
+KYJNÂˆ›Üˆ[ˆÍËL×HÂˆØ[YKœİ™X[Z[™Âˆš[œÙ\Ü™[[İJ	›]]Ø[YKÛÜ›Ú[šÎ™[\J
+JNÂˆØ[YKÛÜ›ˆ˜›ØÚ×Ù[]Y\Âˆš[œÙ\
+
+
+ˆM‹
+K›ØÚÑ[]NÚ\İ
+™XÈV×JJNÂˆBˆËÈØXÚKXÙ[™HXÚÙ]ˆ[İ™HÈ
+MK
+K]˜Y]\ÈL‚ˆØ[YK™›ÜÜ™[[İWØÚ[šÜ×Ûİ]ÛÙ—Ü˜[™ÙJ
+MK
+KL
+NÂˆ\ÜÙ\JYØ[YKÛÜ›˜Ú[šÜË˜ÛÛZ[œ×ÚÙ^J	ŠK
+JJNÂˆ\ÜÙ\JØ[YKÛÜ›˜Ú[šÜË˜ÛÛZ[œ×ÚÙ^J	ŠË
+JJNÂˆ\ÜÙ\JØ[YKÛÜ›˜Ú[šÜË˜ÛÛZ[œ×ÚÙ^J	ŠLË
+JJNÂˆËÈØXÚK\˜Y]\ÈXÚÙ]ˆÚš[šÚ[™ÈÈˆÙY\È˜Y]\ÈH\›İ[™
+MK
+K‚ˆØ[YK™›ÜÜ™[[İWØÚ[šÜ×Ûİ]ÛÙ—Ü˜[™ÙJ
+MK
+KŠNÂˆ\ÜÙ\JYØ[YKÛÜ›˜Ú[šÜË˜ÛÛZ[œ×ÚÙ^J	ŠË
+JJNÂˆ\ÜÙ\JØ[YKÛÜ›˜Ú[šÜË˜ÛÛZ[œ×ÚÙ^J	ŠLË
+JJNÂˆ\ÜÙ\JYØ[YKÛÜ›˜›ØÚ×Ù[]Y\Ë˜ÛÛZ[œ×ÚÙ^J	ŠÈ
+ˆM‹
+JJNÂˆËÈH]\ˆ›Ü™Ù]›Üˆ[ˆ]šXİYÛÛ[[ˆ\È\›[\ÜË‚ˆØ[YK™›Ü™Ù]Ü™[[İWØÛÛ[[œÊ	›]]ÊË
+WKš[×Ú]\Š
+K˜ÛÛXİ
+
+KYJNÂˆØ[YK™›Ü™Ù]Ø[Ü™[[İWØÛÛ[[œÊ
+NÂˆ\ÜÙ\JØ[YKÛÜ›˜Ú[šÜËš\×Ù[\J
+JNÂˆ\ÜÙ\JØ[YKÛÜ›˜›ØÚ×Ù[]Y\Ëš\×Ù[\J
+JNÂˆJNÂˆB‚ˆËËÈHÛY[Ú[šÈÙX[H
+Ø[YKÛ™]ÛÜšËÜ™[[İWØÚ[šÜËœœÊHXÜ›ÜÜÈ]™\Hœ™YBˆËËÈ›İ]K\ÈHœ™YYÙ]XXÚ›İ]H™]\›œÎˆH›Ü™Ù]XÚÙ]BˆËËÈXYÙ\ˆÙ[™K[[İ™H›Ü
+HØXÚKXÙ[™HXÚÙ]
+KH˜Y]\Ë\Úš[šÂˆËËÈ›Ü
+HØXÚK\˜Y]\ÈXÚÙ]
+H[™HÛY[]™[ÛÚ[™ËˆÛ™Hœ™YYˆËËÈ[H\ˆÛÛ[[‹[ˆHÜ™\ˆH›İ]\Èœ™YH[K[™H™\X]ˆËËÈ›Ü™Ù]›Üˆ[ˆ[™XYKYœ™YYÛÛ[[ˆœ™Y\È›İ[™ÎˆYÜ[™ÈHÛÛ[[‚ˆËËÈ\ÈHÚ[šÈXÚÙ]	ÜÈÚ[™È
+™[[İWØÚ[šØ
+K›İHİ™X[Z[™ÂˆËËÈ]™[	ÜË‚ˆÖİ\İBˆÖÚYÛ›Ü™HH›™YYÈ™\\™Y™\Ûİ\˜Ù\È[ˆÔ’V“Ó—ÕTÕÔ‘TÓÕTÑTÈ—Bˆ›ˆ]™\WÙœ™YWÜ›İ]WÜ™]\›œ×İWØÛÛ[[œ×Ú]Ùœ™YYÛÛ˜ÙJ
+HÂˆ\ÙHİ\\œİ\\›˜]]™WÙ[]WÜ™YœÎ\İÎÚ]ÙØ[YNÂˆ\ÙHÜš^›Û—ØÛY[˜Ú[šÎÚ[šÎÂ‚ˆÚ]ÙØ[YJØ[Y_Âˆ›Üˆ[ˆÌWHÂˆØ[YKœİ™X[Z[™Âˆš[œÙ\Ü™[[İJ	›]]Ø[YKÛÜ›Ú[šÎ™[\J
+JNÂˆBˆËÈH›Ü™Ù]XÚÙ]œ™Y\È]ÈÛÛ[[ˆÛ˜ÙNÈHØ[YH›Ü™Ù]YØZ[‹ˆËÈ›ÜˆHÛÛ[[ˆ[™XYHœ™YYœ™Y\È›İ[™Ë‚ˆ]]]ÛÛ™HHÊ
+WKš[×Ú]\Š
+K˜ÛÛXİ
+
+NÂˆ\ÜÙ\Ù\HJØ[YK™›Ü™Ù]Ü™[[İWØÛÛ[[œÊ	›]]ÛÛ™KYJKÊ
+WJNÂˆ]]]ÛÛ™HHÊ
+WKš[×Ú]\Š
+K˜ÛÛXİ
+
+NÂˆ\ÜÙ\JØ[YK™›Ü™Ù]Ü™[[İWØÛÛ[[œÊ	›]]ÛÛ™KYJKš\×Ù[\J
+JNÂˆ›Üˆ[ˆÍËL×HÂˆØ[YKœİ™X[Z[™Âˆš[œÙ\Ü™[[İJ	›]]Ø[YKÛÜ›Ú[šÎ™[\J
+JNÂˆBˆËÈHÙ[™H[İ™HÈ
+MK
+H]˜Y]\ÈLœ™Y\È
+K
+HÛ›K‚ˆ\ÜÙ\Ù\HJØ[YK™›ÜÜ™[[İWØÚ[šÜ×Ûİ]ÛÙ—Ü˜[™ÙJ
+MK
+KL
+KÊK
+WJNÂˆËÈÚš[šÚ[™ÈH˜Y]\ÈÈˆœ™Y\È
+Ë
+HÛ›K‚ˆ\ÜÙ\Ù\HJØ[YK™›ÜÜ™[[İWØÚ[šÜ×Ûİ]ÛÙ—Ü˜[™ÙJ
+MK
+KŠKÊË
+WJNÂˆËÈHÛY[]™[ÛÚ[™Èœ™Y\ÈÚ]\ÈY‚ˆ\ÜÙ\Ù\HJØ[YK™›Ü™Ù]Ø[Ü™[[İWØÛÛ[[œÊ
+KÊLË
+WJNÂˆ\ÜÙ\JØ[YKÛÜ›˜Ú[šÜËš\×Ù[\J
+JNÂˆ\ÜÙ\JØ[YKÛÜ›˜›ØÚ×Ù[]Y\Ëš\×Ù[\J
+JNÂˆJNÂˆB‚ˆËËÈHÙX[HÚ]È]HXÚÙ]]™[ˆİ™X[Z[™ÈYÜ[™Ë™\XÚ[™ÈÜ‚ˆËËÈ™K\Ù[™[™ÈHÛÛ[[ˆÙY\È]™\ÚY[8 %H™K\Ù[ÜÚ][ÛˆØYÂˆËËÈYØZ[ˆ
+™[[İWØÚ[šØ
+K™]™\ˆ[ˆ[›ØY[™HØY8 %ÛÈH›Ü™Ù]ˆËËÈ™]\›œÈ^XİH]‚ˆÖİ\İBˆÖÚYÛ›Ü™HH›™YYÈ™\\™Y™\Ûİ\˜Ù\È[ˆÔ’V“Ó—ÕTÕÔ‘TÓÕTÑTÈ—Bˆ›ˆİ™X[Z[™×ØYÜ[Û—Ø[™Ü™\Ù[™Üİ^WÜ™\ÚY[İ[[İWÙ›Ü™Ù]
+
+HÂˆ\ÙHİ\\œİ\\›˜]]™WÙ[]WÜ™YœÎ\İÎÚ]ÙØ[YNÂˆ\ÙHÜš^›Û—ØÛY[˜Ú[šÎÚ[šÎÂ‚ˆÚ]ÙØ[YJØ[Y_ÂˆØ[YKœİ™X[Z[™Âˆš[œÙ\Ü™[[İJ	›]]Ø[YKÛÜ›Ú[šÎ™[\J
+JNÂˆËÈH™K\Ù[™ÙˆH™\ÚY[]ÛÛ[[ˆZÙ\È™\XÙWÜ™[[İK‚ˆØ[YKœİ™X[Z[™Âˆœ™\XÙWÜ™[[İJ	›]]Ø[YKÛÜ›Ú[šÎ™[\J
+JNÂˆ\ÜÙ\JØ[YKÛÜ›˜Ú[šÜË˜ÛÛZ[œ×ÚÙ^J	Š
+JJNÂˆ]]]ÛÛ™HHÊ
+WKš[×Ú]\Š
+K˜ÛÛXİ
+
+NÂˆ\ÜÙ\Ù\HJØ[YK™›Ü™Ù]Ü™[[İWØÛÛ[[œÊ	›]]ÛÛ™KYJKÊ
+WJNÂˆJNÂˆB‚ˆÖİ\İBˆÖÚYÛ›Ü™HH›™YYÈ™\\™Y™\Ûİ\˜Ù\È[ˆÔ’V“Ó—ÕTÕÔ‘TÓÕTÑTÈ—Bˆ›ˆ›Ú[š[™×ØWÜÙ\™\—Ù[\Y\×İWÛÙ™—Ú[™İÛÊ
+HÂˆËÈÛY[XÚÙ]\İ[™\‹š[™SÙÚ[ˆXZÙ\ÈH™]ÈØØ[^Y\‹ÚÜÙHÚÛH[™[ÜH\ÂˆËÈ[\NˆHÙ\™\ˆ]™]™\ˆÙ[™ÈÛİH]\İ›İX]™HH\İÙ\™\‰ÜÈ][K‚ˆ\ÙHÜ˜]N™Ø[YNÂˆ]Y[ËØ[YKÜ[ÛœË›ÙÜ™\ÜËÙ][™ÜË^Xİ][Û—Ü›ÛN‘^Xİ][Û”›ÛKØYÜ™\Ûİ\˜Ù\ËˆNÂˆ\ÙHÜš^›Û—ØÛY[š][\Î’][TİXÚÎÂˆ]›ÛİHİœ]”]Y™œ›ÛJİ™[˜\—ÛÜÊ’Ô’V“Ó—ÕTÕÔ‘TÓÕTÑTÈŠK[Ü˜\
+
+JNÂˆ]Ù][™ÜÈHÙ][™ÜÎ™Y˜][
+
+NÂˆ]ØYYHØYÜ™\Ûİ\˜Ù\ÊˆÜš^›Û—Ø\ÜÙ]Îœ™\Ûİ\˜ÙWÜÛİ\˜ÙN”™\Ûİ\˜ÙT›Ûİ™\™XİÜJ›Ûİ˜ÛÛ™J
+JKˆ™XÎ›™]Ê
+Kˆ›Û™Kˆ	œ›Ûİˆ	œÙ][™ÜËˆİ[YN’[œİ[››İÊ
+Kˆ˜[ÙKˆÜ˜]N™Ø[YN™^Xİ][Û—Ü›ÛN‘^Xİ][Û”›ÛN’[YÜ˜]YÙ\™\‹ˆ	”›ÙÜ™\ÜÎ›™]Ê
+Kˆ	›]]Ëß[œ™XXÚX›HJ
+Kˆ
+Bˆ[Ü˜\
+
+NÂˆ]]]Ü[ÛœÈHÜ[ÛœÎœ\œÙJİš]\™[\J
+JK[Ü˜\
+
+K[Ü˜\
+
+NÂˆÜ[ÛœËœ™\Ûİ\˜Ù\ÈH›Ûİ˜ÛÛ™J
+NÂˆÜ[ÛœË™^Xİ][Û—Ü›ÛHH^Xİ][Û”›ÛNÛY[Âˆ]]]Ø[YHHØ[YN›™]Êˆ	›ØYYœ™\Ûİ\˜Ù\ËˆØYYœXÚËˆØYY™İZK[Ü˜\
+
+KˆÜ[ÛœËˆÙ][™ÜËˆ]Y[ÎœÚ[[
+	šÜš^›Û—Ø\ÜÙ]Îœ™\Ûİ\˜ÙWÜÛİ\˜ÙN”™\Ûİ\˜ÙTÛİ\˜ÙN™\™XİÜJˆ›Ûİ˜ÛÛ™J
+Kˆ
+JKˆ›Û™Kˆ
+Bˆ[Ü˜\
+
+NÂˆ]
+š\œİÙš\œİÜÙ\™\ŠHHÜš^›Û—Ü›İØÛÛ˜ÛÛ›™Xİ[Û”\NœZ\Š
+NÂˆØ[YK˜ÛÛ›™XİÛØØ[
+š\œİ’Ü\İŠK[Ü˜\
+
+NÂˆ]İXÚÈHÛÛYJ][TİXÚÎ›™]Ê›Z[™XÜ˜YœÚY[‹JJNÂˆØ[YKš[™[ÜVÌHHİXÚÊ
+NÂˆØ[YK˜\›[Ü–ÌHHİXÚÊ
+NÂˆØ[YK›Ù™š[™HİXÚÊ
+NÂˆ]
+ÙXÛÛ™ÜÙXÛÛ™ÜÙ\™\ŠHHÜš^›Û—Ü›İØÛÛ˜ÛÛ›™Xİ[Û”\NœZ\Š
+NÂˆØ[YK˜ÛÛ›™XİÛØØ[
+ÙXÛÛ™’Ü\İŠK[Ü˜\
+
+NÂˆ\ÜÙ\JØ[YKš[™[ÜVÌKš\×Û›Û™J
+H	‰ˆØ[YK˜\›[Ü–ÌKš\×Û›Û™J
+JNÂˆ\ÜÙ\JØ[YK›Ù™š[™š\×Û›Û™J
+JNÂˆB‚ˆÖİ\İBˆ›ˆWØÚ[š×ÜİÜ˜YÙWİZÙ\×Ø[WÜ˜Y]\×Ø[™ØÙ[™WØWÜÙ\™\—ÜÙ[™Ê
+HÂˆ\ÙHİ\\š[—ÜİÜ˜YÙWÜ˜[™ÙNÂˆËÈ˜[š[IÜÈİÜ˜YÙNˆ˜Y]\È]X\İ‹\ÈËXXÚØ^Hœ›ÛHHÙ[™K‚ˆ\ÜÙ\J[—ÜİÜ˜YÙWÜ˜[™ÙJL
+
+KLËLLÊJNÂˆ\ÜÙ\JZ[—ÜİÜ˜YÙWÜ˜[™ÙJL
+
+KM
+JNÂˆ\ÜÙ\J[—ÜİÜ˜YÙWÜ˜[™ÙJMK
+LL
+KLKMJJNÂˆ\ÜÙ\JZ[—ÜİÜ˜YÙWÜ˜[™ÙJ
+LL
+KL‹L
+JNÂˆËÈİ]ÙˆLÌ‰ÜÈ˜[™ÙK\ÈHÙ\™\ˆX^HÙ[™ˆ›Èİ™\™›İË[™Hİ[\ÈHÜ˜\ÛİÜ›Û™Ë‚ˆ\ÜÙ\J[—ÜİÜ˜YÙWÜ˜[™ÙJLÌ“PV
+
+KLÌ“PVLÌ“RSˆ
+ÈJJNÂˆ\ÜÙ\JZ[—ÜİÜ˜YÙWÜ˜[™ÙJL
+LÌ“RS‹
+KLÌ“PV
+JNÂˆ\ÜÙ\J[—ÜİÜ˜YÙWÜ˜[™ÙJˆLˆ
+LÌ“RS‹LÌ“PV
+KˆLÌ“RSˆ
+ÈLËˆLÌ“PVHLÂˆ
+JNÂˆB‚ˆ\ÙHİ\\Âˆ›Ø]Ú[\˜XİÜ\ÜÙ\ËÚ]ØY\—Ù]™[ÛY[Ú\×Û]™[ÛÜÙ\™\—Ùš\™Kˆ][WÙœ˜[YWÚ[\˜XİÜ\ÜÙ\ËÙY\ØÛY[Üİ]KÜ[—Ú\ÚÛÜ™\‹™[[İWÛØš™XİÜİÚ[™ÜËˆ™[[İWİ\ÙWÜİÚ[™ÜËÚ\WÛYY]ËÛ˜\İ\™Ù]Ş[˜ÙYÛØØ[İ\ÙKˆNÂ‚ˆÖİ\İBˆÖÚYÛ›Ü™HH›™YYÈ™\\™Y™\Ûİ\˜Ù\È[ˆÔ’V“Ó—ÕTÕÔ‘TÓÕTÑTÈ[™ØÜ˜]ÚÛY\ËØİÙ—Bˆ›ˆ˜XÚÚ[™×Ù[Z]\œ×Ù›Ûİ×İWÜXÚÙ]İ\™Ù]
+
+HÂˆ\ÙHÜ˜]N™Ø[YNÂˆ]Y[ËØ[YKÜ[ÛœË›ÙÜ™\ÜËÙ][™ÜË^Xİ][Û—Ü›ÛN‘^Xİ][Û”›ÛKˆØYÜ™\Ûİ\˜Ù\Ëİ[N•ÕSWÑU‘S•ˆNÂˆ\ÙHÜš^›Û—ØÛY[Û[İ[Û”^Y\“[İ[Û‹\XÛ\Î”\XÛU\KÜÙN”ÜÙ_NÂˆ\ÙHÜš^›Û—ØÛÜ™N™Ù[ÛY]N•™XÌÎÂˆ\ÙHÜš^›Û—Ü›İØÛÛÂˆ[]WÙ]NÕ˜[YKÙ\šX[^™\ŸKˆXÚÙ]Îœ^NÜÙ[‹ÛY[›İ[™\ÈßKˆNÂ‚ˆ]›ÛİHİœ]”]Y™œ›ÛJİ™[˜\—ÛÜÊ’Ô’V“Ó—ÕTÕÔ‘TÓÕTÑTÈŠK[Ü˜\
+
+JNÂˆ]Ù][™ÜÈHÙ][™ÜÎ™Y˜][
+
+NÂˆ]ØYYHØYÜ™\Ûİ\˜Ù\ÊˆÜš^›Û—Ø\ÜÙ]Îœ™\Ûİ\˜ÙWÜÛİ\˜ÙN”™\Ûİ\˜ÙT›Ûİ™\™XİÜJ›Ûİ˜ÛÛ™J
+JKˆ™XÎ›™]Ê
+Kˆ›Û™Kˆ	œ›Ûİˆ	œÙ][™ÜËˆİ[YN’[œİ[››İÊ
+Kˆ˜[ÙKˆÜ˜]N™Ø[YN™^Xİ][Û—Ü›ÛN‘^Xİ][Û”›ÛN’[YÜ˜]YÙ\™\‹ˆ	”›ÙÜ™\ÜÎ›™]Ê
+Kˆ	›]]Ëß[œ™XXÚX›HJ
+Kˆ
+Bˆ[Ü˜\
+
+NÂˆ]]]Ü[ÛœÈHÜ[ÛœÎœ\œÙJİš]\™[\J
+JK[Ü˜\
+
+K[Ü˜\
+
+NÂˆÜ[ÛœËœ™\Ûİ\˜Ù\ÈH›Ûİ˜ÛÛ™J
+NÂˆÜ[ÛœË™^Xİ][Û—Ü›ÛHH^Xİ][Û”›ÛNÛY[Âˆ]]]Ø[YHHØ[YN›™]Êˆ	›ØYYœ™\Ûİ\˜Ù\ËˆØYYœXÚËˆØYY™İZK[Ü˜\
+
+KˆÜ[ÛœËˆÙ][™ÜËˆ]Y[ÎœÚ[[
+	šÜš^›Û—Ø\ÜÙ]Îœ™\Ûİ\˜ÙWÜÛİ\˜ÙN”™\Ûİ\˜ÙTÛİ\˜ÙN™\™XİÜJˆ›Ûİ˜ÛÛ™J
+Kˆ
+JKˆ›Û™Kˆ
+Bˆ[Ü˜\
+
+NÂˆ]
+ÛY[ÜÙ\™\ŠHHÜš^›Û—Ü›İØÛÛ˜ÛÛ›™Xİ[Û”\NœZ\Š
+NÂˆØ[YK˜ÛÛ›™XİÛØØ[
+ÛY[‘[Z]\•\İŠK[Ü˜\
+
+NÂˆØ[YKœ™[[İK˜\×Û]]
+
+K[Ü˜\
+
+K™[]WÚYHÎÂˆØ[YKœ^Y\ˆHÛÛYJ^Y\“[İ[Û›™]ÊØ[YK›[İ[Û‹™XÌÎ›™]ÊŒŒŒ
+JK[Ü˜\
+
+JNÂˆØ[YKœ\XÛ\ËœÙYYÜ˜[™Û\Ê‹Ë
+NÂ‚ˆ]ÚXÚÈHØ[YNˆ	‘Ø[YO	×Ï‹K™Y]ˆÙÈ×KZYÚˆŒÌŸÂˆ]]]ÙY[ˆH˜[ÙNÂˆ›Üˆ
+Ü[ÛœË]™[ØÚ]JH[ˆØ[YKœ\XÛ\Ëœ™\]Y\İY˜\×Ü™YŠ
+K[Ü˜\
+
+HÂˆYˆÜ[ÛœËHOHHÂˆÛÛ[YNÂˆBˆÙY[ˆHYNÂˆ]HH™Y]ÌWH
+È™œ›ÛJZYÚ
+H
+ˆ
+H
+È
+™[ØÚ]VÌWHHŒŠHÈŒ
+NÂˆ\ÜÙ\J
+]ÌHH™Y]ÌJK˜XœÊ
+HH™œ›ÛJ—ÙŒÌŠHÈŒ
+NÂˆ\ÜÙ\Jˆ
+]ÌWHHJK˜XœÊ
+HYKLLˆİNßH]Ø]ßK^XİYHŞ_H‚ˆ
+NÂˆ\ÜÙ\J
+]Ì—HH™Y]Ì—JK˜XœÊ
+HH™œ›ÛJ—ÙŒÌŠHÈŒ
+NÂˆBˆ\ÜÙ\JÙY[‹››ÈİNßH[Z\ÜÚ[ÛœÈŠNÂˆNÂˆ]\\ÈHÂˆ\XÛU\NÜš]ˆ\XÛU\N‘[˜Ú[Y]ˆ\XÛU\N•İ[SÙ•[™Z[™ËˆNÂˆ]\™Ù]HÂˆ]İ\HÍKŒŒËŒNÂˆØ[YKœÜ]Û—Ù[]J\™Ù]›Z[™XÜ˜Yœ^Y\ˆ‹İ\ÌŒÈ×JNÂˆØ[YKœ\XÛ\Ëœ™\]Y\İYHÛÛYJ™XÎ›™]Ê
+JNÂˆ›ÜˆXİ[Ûˆ[ˆÌK—HÂˆØ[YKš[™WÜXÚÙ]
+Î[š[X]J^N[š[X]HÈYˆ\™Ù]Xİ[ÛˆJJBˆ[Ü˜\
+
+NÂˆBˆØ[YKš[™WÜXÚÙ]
+Î‘[]Q]™[
+^N‘[]Q]™[ÂˆYˆ\™Ù]ˆ]™[ˆÕSWÑU‘S•ˆJJBˆ[Ü˜\
+
+NÂˆ›ÜˆH[ˆ\\ÈÂˆÚXÚÊ	™Ø[YKKİ\K
+NÂˆB‚ˆ][İ™YHÌMKŒKŒL‹ŒNÂˆØ[YKœ\XÛ\Ëœ™\]Y\İYHÛÛYJ™XÎ›™]Ê
+JNÂˆØ[YKš[™WÜXÚÙ]
+Î”Ù][]Q]J^N”Ù][]Q]HÂˆYˆ\™Ù]ˆ˜[Y\Îˆ™XÈVÊ‹Ù\šX[^™\”ÔÑK˜[YN’Y
+ÜÙNÜ›İXÚ[™ËšY
+
+JJWKˆJJBˆ[Ü˜\
+
+NÂˆØ[YKš[™WÜXÚÙ]
+Î‘[]TÜÚ][Û”Ş[˜Ê^N‘[]TÜÚ][Û”Ş[˜ÈÂˆYˆ\™Ù]ˆ]ˆ^N”ÜÚ][Û”]“[™X\Š[İ™Y
+KˆX]ÎˆŒˆ]ÚˆŒˆÛ—ÙÜ›İ[™ˆYKˆJJBˆ[Ü˜\
+
+NÂˆ›ÜˆÈ[ˆ‹ÂˆØ[YKXÚ×Ü™[[İWÙ[]Y\ÊYJNÂˆBˆØ[YKXÚ×Ü\XÛ\Ê
+NÂˆ›ÜˆH[ˆ\\ÈÂˆÚXÚÊ	™Ø[YKK[İ™YKJNÂˆB‚ˆËÈHÛ[]H[İ™YYØZ[ˆ™Y›Ü™H[œZ\š[™Ëˆ™K\Z\š[™È]ÈY™Y›Ü™BˆËÈH™^\XÛHXÚÈÙY\È[Z][™È]HÛ[]IÜÈš[˜[›ÙK‚ˆØ[YKœ\XÛ\Ëœ™\]Y\İYHÛÛYJ™XÎ›™]Ê
+JNÂˆ]\İHÌNŒKŒL‹ŒNÂˆØ[YK›[Ø—Ú[™^ˆ™Ù]Û]]
+	›]]Ø[YK›[ØœË\™Ù]\ÈLÌŠBˆ[Ü˜\
+
+BˆœÜÚ][ÛˆH™XÌÎ›™]Ê\İÌK\İÌWK\İÌ—JNÂˆØ[YKš[™WÜXÚÙ]
+Î”™[[İ™Q[]Y\Ê^N”™[[İ™Q[]Y\ÈÂˆYÎˆ™XÈVİ\™Ù]KˆJJBˆ[Ü˜\
+
+NÂˆØ[YKœÜ]Û—Ù[]J\™Ù]›Z[™XÜ˜Yœ^Y\ˆ‹ÌŒËŒKŒKÌŒÈ×JNÂˆØ[YKXÚ×Ü\XÛ\Ê
+NÂˆ›ÜˆH[ˆ\\ÈÂˆÚXÚÊ	™Ø[YKK\İKJNÂˆB‚ˆØ[YKœ\XÛ\Ë˜ÛX\Š
+NÂˆØ[YKœ\XÛ\Ëœ™\]Y\İYHÛÛYJ™XÎ›™]Ê
+JNÂˆØ[YKš[™WÜXÚÙ]
+Î‘[]Q]™[
+^N‘[]Q]™[ÂˆYˆËˆ]™[ˆÕSWÑU‘S•ˆJJBˆ[Ü˜\
+
+NÂˆÚXÚÊ	™Ø[YK\XÛU\N•İ[SÙ•[™Z[™ËÌŒŒŒKK
+NÂˆØ[YKœ\XÛ\Ëœ™\]Y\İYHÛÛYJ™XÎ›™]Ê
+JNÂˆ]^Y\ˆHØ[YKœ^Y\‹˜\×Û]]
+
+K[Ü˜\
+
+NÂˆ^Y\‹œÜÚ][ÛˆH™XÌÎ›™]ÊMŒŒŒ
+NÂˆ^Y\‹œÙ]ÜÜÙJÜÙN”İÚ[[Z[™ÊK[Ü˜\
+
+NÂˆØ[YKXÚ×Ü\XÛ\Ê
+NÂˆÚXÚÊ	™Ø[YK\XÛU\N•İ[SÙ•[™Z[™ËËMŒŒŒKŠNÂˆB‚ˆËËÈH˜[š[H‹ŒÈÛY[	ÜÈÙ\™\˜›İ[™ÛÛZ[™\ÛXÚÔXÚÙ]›ÜˆHÚYXÛXÚÈœ›ÛHİ˜\ˆÛİÍÂˆËËÈ[ÈÛİL\İYÍÈš\œİ
+Ú\™Hİ™X[H\›™\ÜË[™[ÜX
+KˆHÙ^H[Ø^\ÈXYË‚ˆÖİ\İBˆ›ˆÚ[™ÙYÜÛİ×ÙÛ×Ûİ]Ú[—İWÛÜ™\—İ˜[š[WÜ×Ú\ÚÛX\Ú]\˜]\Ê
+HÂˆ\ÜÙ\Ù\HJÜ[—Ú\ÚÛÜ™\Š	–ÌLÍ×JKÌÍËLJNÂˆ\ÜÙ\Ù\HJÜ[—Ú\ÚÛÜ™\Š	–ÌK‹Í‹JVÌK
+NÂˆËÈ\İÙ^\ÈHX›HÜ›İÜÎÈ]™\HÙ^H\Èİ[\İYÛ˜ÙK‚ˆ][ˆ™XÏLMˆH
+‹ŠK˜ÛÛXİ
+
+NÂˆ]]]İ]HÜ[—Ú\ÚÛÜ™\Š	˜[
+NÂˆİ]œÛÜİ[œİX›J
+NÂˆ\ÜÙ\Ù\HJİ][
+NÂˆB‚ˆÖİ\İBˆ›ˆ\YØÚ]Ú\×ÜÙ[Ø\×İWØÛY[ØÚ]Ù]™[ÛX]™\×Ú]
+
+HÂˆ\ÜÙ\Ù\HJÚ]ØY\—Ù]™[
+š[È‹ËßßJKÛÛYJš[È‹š[Ê
+JJNÂˆ\ÜÙ\Ù\HJˆÚ]ØY\—Ù]™[
+š[È‹KßKœ\ÚÜİŠˆÛÜ›ŠJKˆÛÛYJš[ÈÛÜ›‹š[Ê
+JBˆ
+NÂˆ\ÜÙ\Ù\HJÚ]ØY\—Ù]™[
+š[È‹Ëß
+˜ÈHYJK›Û™JNÂˆ\ÜÙ\Ù\HJÚ]ØY\—Ù]™[
+š[È‹KßK˜ÛX\Š
+JK›Û™JNÂˆB‚ˆÖİ\İBˆÖÚYÛ›Ü™HH›™YYÈ™\\™Y™\Ûİ\˜Ù\È[ˆÔ’V“Ó—ÕTÕÔ‘TÓÕTÑTÈ—Bˆ›ˆ›ØÚ×Ø[X\×Üİ\š]˜[ØÛÛœİ[\[Û—Ø[™ØÛY[Ü™YXİ[ÛŠ
+HÂˆ\ÙHÜ˜]N™Ø[YNĞ]Y[ËØ[YKÜ[ÛœË›ÙÜ™\ÜËÙ][™ÜËÛÜ›ØYÜ™\Ûİ\˜Ù\ßNÂˆ\ÙHÜš^›Û—ØÛY[ÂˆÚ[šÎÚ[šËˆ][\Î’][TİXÚËˆ[ÙØÛÛ[ĞÛÛ[[ÙZ[KˆNÂˆ\ÙHÜš^›Û—Û[ÙÜXÚØYÙN˜ÛÛ[Ğ›ØÚËÛÛ[][_NÂˆ\ÙHİÜ]”]Y‹Ş[˜Î\˜ßNÂˆ]˜\ÙHH]Y™œ›ÛJˆİ™[˜\—ÛÜÊ’Ô’V“Ó—ÕTÕÔ‘TÓÕTÑTÈŠK™^Xİ
+œ™\\™Y™\Ûİ\˜Ù\È™\]Z\™YŠKˆ
+NÂˆ]›ÛİHİ™[[\Ù\Š
+Kš›Ú[Š›Ü›X]JšÜš^›Û‹X[X\ËYØ[YK^ßH‹İœ›ØÙ\ÜÎšY
+
+JJNÂˆ]]]ÛÛ[HÛÛ[™XÛ\™Y
+œXHŠNÂˆÛÛ[ˆ™XÛ\™Jˆ	–Ğ›ØÚÈÂˆYˆœXN™œ˜[YH‹š[Ê
+Kˆ[\]Nˆ›Z[™XÜ˜YœİÛ™H‹š[Ê
+Kˆ][Nˆ˜[ÙKˆ‹‘Y˜][™Y˜][
+
+BˆWKˆ	–È™[\H‹™š[Y—K›X\
+˜[Y_][HÂˆYˆ›Ü›X]JœXNÛ˜[Y_HŠKˆ[\]Nˆ›Z[™XÜ˜YœİXÚÈ‹š[Ê
+Kˆ›ØÚÎˆÛÛYJœXN™œ˜[YH‹š[Ê
+JKˆ‹‘Y˜][™Y˜][
+
+BˆJKˆ
+Bˆ[Ü˜\
+
+NÂˆ][ÙÈHĞÛÛ[[ÙÂˆYˆœXH‹š[Ê
+KˆÛÛ[ˆ˜\œÎˆ™XÎ›™]Ê
+KˆWNÂˆ][™[ÜHHÜš^›Û—Û[ÙÜXÚØYÙN™[˜X›Y‘[˜X›Y[ÙÎ›™]ÊÊˆœXH‹×ÛİÛ™Y
+
+KˆÜš^›Û—Û[ÙÜXÚØYÙN”ÚYN›İˆ
+WJNÂˆZ[
+	˜˜\ÙKİœ]”]›™]ÊˆŠK	›[ÙË	œ›Ûİ	š[™[ÜJK[Ü˜\
+
+NÂˆ]
+™YÚ\İKÊHHÜš^›Û—İÛÜ››]™[™]N›ØYÜ™YÚ\İWİÚ]Ù›YÜÊ	œ›Ûİ
+K[Ü˜\
+
+NÂˆÜ˜]N™Ø[YN˜\Wİ˜[Y\Îœ™YÚ\İ\—ÙØ[YWÚÙ^\Ê
+‹œ™YÚ\İK›[Š
+JK›X\
+YÂˆ™YÚ\İBˆœİ]JÜš^›Û—İÛÜ›œ™YÚ\İN›ØÚÔİ]RY
+Y\ÈLÌŠJBˆ[Ü˜\
+
+Bˆ›˜[YBˆ˜ÛÛ™J
+BˆJJNÂˆ]Ù][™ÜÈHÙ][™ÜÎ™Y˜][
+
+NÂˆ]ØYYHØYÜ™\Ûİ\˜Ù\ÊˆÜš^›Û—Ø\ÜÙ]Îœ™\Ûİ\˜ÙWÜÛİ\˜ÙN”™\Ûİ\˜ÙT›Ûİ™\™XİÜJ›Ûİ˜ÛÛ™J
+JKˆ™XÎ›™]Ê
+Kˆ›Û™Kˆ	œ›Ûİˆ	œÙ][™ÜËˆİ[YN’[œİ[››İÊ
+Kˆ˜[ÙKˆÜ˜]N™Ø[YN™^Xİ][Û—Ü›ÛN‘^Xİ][Û”›ÛN’[YÜ˜]YÙ\™\‹ˆ	”›ÙÜ™\ÜÎ›™]Ê
+Kˆ	›]]Ëß[œ™XXÚX›HJ
+Kˆ
+Bˆ[Ü˜\
+
+NÂˆ]]]Ü[ÛœÈHÜ[ÛœÎœ\œÙJİš]\™[\J
+JK[Ü˜\
+
+K[Ü˜\
+
+NÂˆÜ[ÛœËœ™\Ûİ\˜Ù\ÈH›Ûİ˜ÛÛ™J
+NÂˆÜ[ÛœË™^Xİ][Û—Ü›ÛHHÜ˜]N™Ø[YN™^Xİ][Û—Ü›ÛN‘^Xİ][Û”›ÛN’[YÜ˜]YÙ\™\Âˆ]]]Ø[YHHØ[YN›™]Êˆ	›ØYYœ™\Ûİ\˜Ù\ËˆØYYœXÚËˆØYY™İZK[Ü˜\
+
+KˆÜ[ÛœËˆÙ][™ÜËˆ]Y[ÎœÚ[[
+	šÜš^›Û—Ø\ÜÙ]Îœ™\Ûİ\˜ÙWÜÛİ\˜ÙN”™\Ûİ\˜ÙTÛİ\˜ÙN™\™XİÜJˆ›Ûİ˜ÛÛ™J
+Kˆ
+JKˆ›Û™Kˆ
+Bˆ[Ü˜\
+
+NÂˆØ[YKÛÜ›HÛÜ››™]ÊØ[YKœ™\Ë™˜XİÊ
+K˜Z\‹JNÂˆ›Üˆ[ˆLK‹LHÂˆ›Üˆˆ[ˆLK‹LHÂˆØ[YKÛÜ›ˆ˜Ú[šÜÂˆš[œÙ\
+
+ŠK\˜Î›™]ÊÚ[šÎ™[\JŠJJNÂˆBˆBˆØ[YKœŞ[˜×İXÚ×ØÚ[šÜÊ
+NÂˆØ[YKœÙ]Û[ÙWÚY
+
+NÂˆØ[YKœ^Y\ˆH›Û™NÂˆØ[YKœÙ[XİYHÂˆ]\™Ù]HØ[YBˆœXÚÂˆ˜\ÜÙ]Âˆœ™YÚ\İBˆ™Y˜][Üİ]JœXN™œ˜[YHŠBˆ[Ü˜\
+
+NÂˆ›Üˆ
+K˜[YJH[ˆÈœXN™[\H‹œXN™š[Y—Kš]\Š
+K™[[Y\˜]J
+HÂˆ]ÜÈHÚH\ÈLÌˆ
+ˆ‹ÌNÂˆ]]HÜ˜]N™Ø[YN’]ÂˆÜËˆ˜XÙNˆÌKKˆ[œÚYNˆ˜[ÙKˆÚ[ˆÙ™œ›ÛJÜÖÌJH
+ÈKÌŒWKˆNÂˆ]İXÚÈH][TİXÚÎ›™]Ê˜[YKŠNÂˆ\ÜÙ\Ù\HJØ[YKš][\Ê
+K™Ù]
+˜[YJK[Ü˜\
+
+K˜›ØÚËÛÛYJ\™Ù]
+JNÂˆ]™]šY]ÈHØ[YBˆœ™[[İWØØ[—ÜXÙJ	š]	œİXÚÊBˆ™^Xİ
+˜ÛY[™YXİÈH[X\ÈŠNÂˆ\ÜÙ\Ù\HJÜ™]šY]ËŒ™]šY]ËŒK™]šY]ËŒ—KÜÊNÂˆ\ÜÙ\Ù\HJˆØ[YKÛÜ›˜›ØÚÊÜÖÌKÜÖÌWKÜÖÌ—JKˆØ[YKœ™\Ë™˜XİÊ
+K˜Z\‹ˆœ™YXİ[Ûˆ\ÈH‚ˆ
+NÂˆ
+™Ø[YKš[Û]]
+
+HHÛÛYJİXÚÊNÂˆ\ÜÙ\JØ[YK\ÙWÚ[™
+ÛÛYJ	š]
+JK[Ü˜\
+
+JNÂˆ\ÜÙ\Ù\HJØ[YKÛÜ›˜›ØÚÊÜÖÌKÜÖÌWKÜÖÌ—JK\™Ù]
+NÂˆ][HØ[YKš[
+
+K[Ü˜\
+
+NÂˆ\ÜÙ\Ù\HJ
+	Šš[š][K[˜Ûİ[
+K
+
+›˜[YKJJNÂˆBˆ]›ØÚÙYHÜ˜]N™Ø[YN’]ÂˆÜÎˆÌÌKˆ˜XÙNˆÌKKˆ[œÚYNˆ˜[ÙKˆÚ[ˆÌKÌKŒWKˆNÂˆØ[YKœÙ]Û[ÙWÚY
+ŠNÂˆ]™Y›Ü™HHØ[YKš[
+
+K˜ÛÛ™Y
+
+NÂˆØ[YK\ÙWÚ[™
+ÛÛYJ	˜›ØÚÙY
+JK[Ü˜\
+
+NÂˆ\ÜÙ\Ù\HJˆØ[YKš[
+
+Kˆ™Y›Ü™K˜\×Ü™YŠ
+Kˆ˜Y™[\™H™Y\Ø[ÙY\ÈH[X\ÈİXÚÈ‚ˆ
+NÂˆ›Ü
+Ø[YJNÂˆİ™œÎœ™[[İ™WÙ\—Ø[
+›Ûİ
+K[Ü˜\
+
+NÂˆB‚ˆ\ÙHÜš^›Û—ØÛY[ÂˆÛÛZ[™\œÎĞ™XXÛÛ‹›ØÚÑ[]_Kˆ][\Î’][TİXÚËˆNÂˆ\ÙHÜš^›Û—ØÛÜ™N›˜•YÎÂ‚ˆËËÈÌLŒˆHÙ\™\‰ÜÈÛY[[İ™\È]HÜYYHÙ\™\‰ÜÈ]šX]\ÈÚ]™H]™]™\ˆ]ÂˆËËÈY™™XİÉÈİÛ‹ˆ˜[š[IÜÈÙ\™\ˆ™[[İ™\ÈHÜYY][œÈİ][ˆÙ\™\”^Y\‹™ÕXÚËY\‚ˆËËÈHXÚÉÜÈÙ[™\Q[]Q]NˆÛY[›İ[™™[[İ™S[Ø‘Y™™XİXÚÙ]ÛÙ\Èİ]]Û˜ÙH[™BˆËËÈ[İ™[Y[ÜYYÚ]İ]HY™™Xİ	ÜÈ[ÙYšY\ˆHXÚÈ]\‹ÛÈ›Üˆ]XÚÈHÛY[İ[ˆËËÈ[œÈ˜\İ
+Hİ[Ûˆ[šÈİ\ÈHØ[YHØ^JKˆHÛY[HXÚÈÙ™ˆ\ÈÚ]Üš[PPÉÜÂˆËËÈÚ[][][Ûˆ›YÙÙY‚ˆÖİ\İBˆÖÚYÛ›Ü™HH›™YYÈ™\\™Y™\Ûİ\˜Ù\È[ˆÔ’V“Ó—ÕTÕÔ‘TÓÕTÑTÈ—Bˆ›ˆWÜÙ\™\œ×ØÛY[İZÙ\×Ú]×ÜÜYYÙœ›ÛWİWØ]šX]\×Û›İİWÙY™™Xİ
+
+HÂˆ\ÙHÜ˜]N™Ø[YNĞ]Y[ËØ[YKÜ[ÛœË›ÙÜ™\ÜËÙ][™ÜËØYÜ™\Ûİ\˜Ù\ßNÂˆ\ÙHÜš^›Û—ØÛY[›[İ[Û”^Y\“[İ[ÛÂˆ\ÙHÜš^›Û—ØÛÜ™N™Ù[ÛY]N•™XÌÎÂˆ\ÙHÜš^›Û—Ü›İØÛÛœXÚÙ]Îœ^NÂˆ]šX]S[ÙYšY\‹]šX]TÛ˜\ÚİÛY[›İ[™\ÈË™[[İ™S[Ø‘Y™™Xİˆ\]P]šX]\Ë\]S[Ø‘Y™™XİˆNÂˆ]›ÛİHİœ]”]Y™œ›ÛJˆİ™[˜\—ÛÜÊ’Ô’V“Ó—ÕTÕÔ‘TÓÕTÑTÈŠK™^Xİ
+œ™\\™Y™\Ûİ\˜Ù\È™\]Z\™YŠKˆ
+NÂˆ]Ù][™ÜÈHÙ][™ÜÎ™Y˜][
+
+NÂˆ]ØYYHØYÜ™\Ûİ\˜Ù\ÊˆÜš^›Û—Ø\ÜÙ]Îœ™\Ûİ\˜ÙWÜÛİ\˜ÙN”™\Ûİ\˜ÙT›Ûİ™\™XİÜJ›Ûİ˜ÛÛ™J
+JKˆ™XÎ›™]Ê
+Kˆ›Û™Kˆ	œ›Ûİˆ	œÙ][™ÜËˆİ[YN’[œİ[››İÊ
+Kˆ˜[ÙKˆÜ˜]N™Ø[YN™^Xİ][Û—Ü›ÛN‘^Xİ][Û”›ÛNÛY[ˆ	”›ÙÜ™\ÜÎ›™]Ê
+Kˆ	›]]Ëß[œ™XXÚX›HJ
+Kˆ
+Bˆ[Ü˜\
+
+NÂˆ]]]Ü[ÛœÈHÜ[ÛœÎœ\œÙJİš]\™[\J
+JK[Ü˜\
+
+K[Ü˜\
+
+NÂˆÜ[ÛœËœ™\Ûİ\˜Ù\ÈH›Ûİ˜ÛÛ™J
+NÂˆ]]]Ø[YHHØ[YN›™]Êˆ	›ØYYœ™\Ûİ\˜Ù\ËˆØYYœXÚËˆØYY™İZK[Ü˜\
+
+KˆÜ[ÛœËˆÙ][™ÜËˆ]Y[ÎœÚ[[
+	šÜš^›Û—Ø\ÜÙ]Îœ™\Ûİ\˜ÙWÜÛİ\˜ÙN”™\Ûİ\˜ÙTÛİ\˜ÙN™\™XİÜJˆ›Ûİ˜ÛÛ™J
+Kˆ
+JKˆ›Û™Kˆ
+Bˆ[Ü˜\
+
+NÂˆØ[YKš[š]Ü™[[İWÙ›Ü—Ü™\^J
+K[Ü˜\
+
+NÂˆØ[YKœ^Y\ˆHÛÛYJ^Y\“[İ[Û›™]ÊØ[YK›[İ[Û‹™XÌÎ›™]ÊKŒJJK[Ü˜\
+
+JNÂˆ]YHHØ[YKœ™[[İK˜\×Ü™YŠ
+K[Ü˜\
+
+K™[]WÚYÂˆ]ÜYYHØ[YKœ™[[İWÙY™™XİÛ™]ÛÜš×ÚY
+œÜYYŠK[Ü˜\
+
+NÂˆ]]šX]HHÂˆ]HØ[YKœ^Y\‹˜\×Ü™YŠ
+K[Ü˜\
+
+NÂˆ]Ù^HH˜]šX]\ËšÙ^J›Z[™XÜ˜Y›[İ™[Y[ÜÜYYŠK[Ü˜\
+
+NÂˆÙ^K˜]šX]J
+Kœ™YÚ\İWÚY
+
+BˆNÂˆËÈ^Y\‹˜Ü™X]P]šX]\ÎˆŒQ‹‚ˆ]Ø[Ú[™ÈH™œ›ÛJŒYŒÌŠNÂˆËÈÜYYRNˆŒˆ
+H›Ø]
+HH]™[][\Z[™ÈHİ[‚ˆ][[İ[H™œ›ÛJŒ™ŒÌŠH
+ˆ‹ŒÂˆ]]šX]\ÈHÜYˆ›ÛÛÂˆÎ•\]P]šX]\Ê\]P]šX]\ÈÂˆYˆYKˆ˜[Y\Îˆ™XÈVĞ]šX]TÛ˜\ÚİÂˆ]šX]Kˆ˜\ÙNˆØ[Ú[™Ëˆ[ÙYšY\œÎˆÜYˆ[Š]šX]S[ÙYšY\ˆÂˆYˆ›Z[™XÜ˜Y™Y™™XİœÜYY‹š[Ê
+Kˆ[[İ[ˆÜ\˜][Ûˆ‹ˆJBˆš[×Ú]\Š
+Bˆ˜ÛÛXİ
+
+KˆWKˆJBˆNÂˆËÈXXÚİ\ˆHXÚÙ]ÈÙˆÛ™HÙ\™\ˆXÚË[ˆHÛY[XÚË‚ˆ]]]İ\HXÚÙ]Îˆ™XÏÏŸÂˆ›ÜˆXÚÙ][ˆXÚÙ]ÈÂˆØ[YKš[™WÜXÚÙ]
+XÚÙ]
+K[Ü˜\
+
+NÂˆBˆØ[YKXÚ×ØÛY[ÙY™™XİÊ
+NÂˆØ[YKœ^Y\‚ˆ˜\×Û]]
+
+Bˆ[Ü˜\
+
+Bˆ˜]šX]J›Z[™XÜ˜Y›[İ™[Y[ÜÜYYŠBˆ[Ü˜\
+
+BˆNÂˆ]Y™™XİHÎ•\]S[Ø‘Y™™Xİ
+\]S[Ø‘Y™™XİÂˆYˆYKˆY™™XİˆÜYYˆ[\YšY\ˆKˆ\˜][ÛˆŒˆ›YÜÎˆˆˆJNÂˆ]˜\İHØ[Ú[™È
+ˆ
+KŒ
+È[[İ[
+NÂˆ]ÛÜÙHHNˆˆ
+HHŠK˜XœÊ
+HYKNNÂˆ]ÙY[ˆHÂˆİ\
+™XÈVÙY™™XİJKˆİ\
+™XÈVØ]šX]\ÊYJWJKˆİ\
+™XÎ›™]Ê
+JKˆİ\
+™XÈVĞÎ”™[[İ™S[Ø‘Y™™Xİ
+™[[İ™S[Ø‘Y™™XİÂˆYˆYKˆY™™XİˆÜYYˆJWJKˆİ\
+™XÈVØ]šX]\Ê˜[ÙJWJKˆNÂˆ]^XİYHİØ[Ú[™Ë˜\İ˜\İ˜\İØ[Ú[™×NÂˆ\ÜÙ\JˆÙY[‹š]\Š
+Kš\
+^XİY
+K˜[
+
+	œËJ_ÛÜÙJËJJKˆœÜYYÛˆXXÚXÚÎˆÜÙY[ßK˜[š[IÜÈÛY[ˆÙ^XİYßH‚ˆ
+NÂˆB‚ˆËËÈ][Qœ˜[YKš[\˜XİXœİ˜Xİ›Ø]š[\˜Xİ[™Z[™XØ\š[\˜Xİ‚ˆËËÈ[\˜Xİ[ÛœÈ]\ÜÈX]™HHÛXÚÈÈH[][HÚ]İ]İÚ[™Ú[™ÎÂˆËËÈ™ZXÛH›Ø\™[™È[œİÙ\œÈÓÓ”ÕSQH[™[™ÈHÛXÚÈÚ]İ]H™YXİYİÚ[™È
+ÎLLŒ
+K‚ˆÖİ\İBˆ›ˆØš™XİÚ[\˜Xİ[Ûœ×Ü\Ü×Ø[™ÜİÚ[™×İ˜[š[J
+HÂˆËÈ][Qœ˜[YNˆš^Yœ˜[YHÜˆ[\Hœ˜[YH
+È[\H[™\ÜÙ\Ë‚ˆ\ÜÙ\J][WÙœ˜[YWÚ[\˜XİÜ\ÜÙ\ÊYKYKYJJNÂˆ\ÜÙ\J][WÙœ˜[YWÚ[\˜XİÜ\ÜÙ\ÊYK˜[ÙK˜[ÙJJNÂˆ\ÜÙ\J][WÙœ˜[YWÚ[\˜XİÜ\ÜÙ\Ê˜[ÙK˜[ÙK˜[ÙJJNÂˆËÈ][Qœ˜[YNˆ[œÙ\[™ÈÜˆ›İ][™È][HÙ\È›İ\ÜË‚ˆ\ÜÙ\JZ][WÙœ˜[YWÚ[\˜XİÜ\ÜÙ\Ê˜[ÙKYK˜[ÙJJNÈËÈ›İ]\Âˆ\ÜÙ\JZ][WÙœ˜[YWÚ[\˜XİÜ\ÜÙ\Ê˜[ÙK˜[ÙKYJJNÈËÈ[œÙ\Âˆ\ÜÙ\JZ][WÙœ˜[YWÚ[\˜XİÜ\ÜÙ\Ê˜[ÙKYKYJJNÈËÈ›İ]\Â‚ˆËÈ›Ø]ˆÛ™XZÚ[™ÈÜˆİ]ÙˆÛÛ›Û\ÜÙ\Ë‚ˆ\ÜÙ\J›Ø]Ú[\˜XİÜ\ÜÙ\Ê˜[ÙKYK˜[ÙKYJJNÈËÈÛ™XZÚ[™Âˆ\ÜÙ\J›Ø]Ú[\˜XİÜ\ÜÙ\Ê˜[ÙK˜[ÙKYKYJJNÈËÈİ]ÙˆÛÛ›ÛˆËÈ›Ø]ˆHÛY[[œİÙ\œÈÕPĞÑTÔË›ÛÛHÜˆ›İ
+İ\šY[™È\ÈHÙ\™\‰ÜÊK‚ˆ\ÜÙ\JX›Ø]Ú[\˜XİÜ\ÜÙ\Ê˜[ÙK˜[ÙK˜[ÙKYJJNÂˆ\ÜÙ\JX›Ø]Ú[\˜XİÜ\ÜÙ\Ê˜[ÙK˜[ÙK˜[ÙK˜[ÙJJNÂ‚ˆËÈÚ\İ›Ø]ˆÛ™XZÚ[™ÈÜ[œÈHÚ\İÈ›Ø\™[™È[œİÙ\œÈÕPĞÑTÔË‚ˆ\ÜÙ\JX›Ø]Ú[\˜XİÜ\ÜÙ\ÊYKYK˜[ÙKYJJNÈËÈÜ[œÈÚ\İˆ\ÜÙ\JX›Ø]Ú[\˜XİÜ\ÜÙ\ÊYK˜[ÙK˜[ÙK˜[ÙJJNÈËÈ›Ø\™È
+ÛY[
+BˆËÈÚ\İ›Ø]İ]ÙˆÛÛ›Ûˆ\ÜÙ\ÈÚ]›ÛÛK[ÙHÜ[œÈHÚ\İ‚ˆ\ÜÙ\J›Ø]Ú[\˜XİÜ\ÜÙ\ÊYK˜[ÙKYKYJJNÂˆ\ÜÙ\JX›Ø]Ú[\˜XİÜ\ÜÙ\ÊYK˜[ÙKYK˜[ÙJJNÂ‚ˆËÈİÚ[™ÜÎˆ›Ø\™[™ÈHšYXX›HØ\[œİÙ\œÈÓÓ”ÕSQH
+›ÈİÚ[™ÊK‚ˆ\ÜÙ\J\™[[İWÛØš™XİÜİÚ[™ÜÊ›Û™KYJJNÂˆËÈİÚ[™ÜÎˆİ\ˆØš™Xİ[\˜Xİ[ÛœËH›Ø]	ÜÈ›Ø\™[™ÈÛË[œİÙ\ˆÕPĞÑTÔË‚ˆ\ÜÙ\J™[[İWÛØš™XİÜİÚ[™ÜÊ›Û™K˜[ÙJJNÂˆËÈ[\˜Xİ[Ûˆ[]Y\ÈÛ›Üˆ™\ÜÛœÙK‚ˆ\ÜÙ\J™[[İWÛØš™XİÜİÚ[™ÜÊÛÛYJYJK˜[ÙJJNÂˆ\ÜÙ\J\™[[İWÛØš™XİÜİÚ[™ÜÊÛÛYJ˜[ÙJK˜[ÙJJNÂˆB‚ˆËËÈH[Ù	ÜÈ™KYš[YÚ]Ü[œÈÛ›Hİ™\ˆHÛÜ›Ú]]È^ˆËËÈ\Y[ˆ[™›İ[™ÈÙ[‚ˆÖİ\İBˆÖÚYÛ›Ü™HH›™YYÈ™\\™Y™\Ûİ\˜Ù\È[ˆÔ’V“Ó—ÕTÕÔ‘TÓÕTÑTÈ—Bˆ›ˆ[ÙÛÜ[—ØÚ]Ùš[×İWØ›ŞÛÛ›WÛİ™\—İWİÛÜ›
+
+HÂˆ\ÙHİ\\œİ\\Âˆ]Y[ËØ[YKÜ[ÛœË›ÙÜ™\ÜËØÜ™Y[‹Ù][™ÜË^Xİ][Û—Ü›ÛN‘^Xİ][Û”›ÛKˆØYÜ™\Ûİ\˜Ù\ËˆNÂ‚ˆ]›ÛİHİœ]”]Y™œ›ÛJˆİ™[˜\—ÛÜÊ’Ô’V“Ó—ÕTÕÔ‘TÓÕTÑTÈŠBˆ™^Xİ
+œÙ]Ô’V“Ó—ÕTÕÔ‘TÓÕTÑTÈÈ™\\™Y™\Ûİ\˜Ù\ÈŠKˆ
+NÂˆ]Ù][™ÜÈHÙ][™ÜÎ™Y˜][
+
+NÂˆ]ØYYHØYÜ™\Ûİ\˜Ù\ÊˆÜš^›Û—Ø\ÜÙ]Îœ™\Ûİ\˜ÙWÜÛİ\˜ÙN”™\Ûİ\˜ÙT›Ûİ™\™XİÜJ›Ûİ˜ÛÛ™J
+JKˆ™XÎ›™]Ê
+Kˆ›Û™Kˆ	œ›Ûİˆ	œÙ][™ÜËˆİ[YN’[œİ[››İÊ
+Kˆ˜[ÙKˆÜ˜]N™Ø[YN™^Xİ][Û—Ü›ÛN‘^Xİ][Û”›ÛN’[YÜ˜]YÙ\™\‹ˆ	”›ÙÜ™\ÜÎ›™]Ê
+Kˆ	›]]Ëß[œ™XXÚX›HJ››ÈY[H[™Ù™ˆŠKˆ
+Bˆ[Ü˜\
+
+NÂˆ]]]Ü[ÛœÈHÜ[ÛœÎœ\œÙJİš]\™[\J
+JK[Ü˜\
+
+K[Ü˜\
+
+NÂˆÜ[ÛœËœ™\Ûİ\˜Ù\ÈH›Ûİ˜ÛÛ™J
+NÂˆÜ[ÛœË™^Xİ][Û—Ü›ÛHH^Xİ][Û”›ÛNÛY[Âˆ]]]Ø[YHHØ[YN›™]Êˆ	›ØYYœ™\Ûİ\˜Ù\ËˆØYYœXÚËˆØYY™İZK[Ü˜\
+
+KˆÜ[ÛœËˆÙ][™ÜËˆ]Y[ÎœÚ[[
+	šÜš^›Û—Ø\ÜÙ]Îœ™\Ûİ\˜ÙWÜÛİ\˜ÙN”™\Ûİ\˜ÙTÛİ\˜ÙN™\™XİÜJˆ›Ûİ˜ÛÛ™J
+Kˆ
+JKˆ›Û™Kˆ
+Bˆ[Ü˜\
+
+NÂ‚ˆËÈ›È^Y\ˆH]HØÜ™Y[‹‚ˆØ[YKœ^Y\ˆH›Û™NÂˆ\ÜÙ\JØ[YK›Ü[—ØÚ]
+‹İŠKš\×Ù\œŠ
+JNÂˆ\ÜÙ\JØ[YKZK˜Ú]ÜØÜ™Y[‹š\×Û›Û™J
+JNÂˆØ[YKœ^Y\ˆHÛÛYJˆÜš^›Û—ØÛY[›[İ[Û”^Y\“[İ[Û›™]ÊˆØ[YK›[İ[Û‹ˆÜš^›Û—ØÛÜ™N™Ù[ÛY]N•™XÌÎ–‘T“Ëˆ
+Bˆ[Ü˜\
+
+Kˆ
+NÂˆØ[YKœØÜ™Y[ˆHØÜ™Y[”]\ÙYÂˆ\ÜÙ\JØ[YK›Ü[—ØÚ]
+‹İŠKš\×Ù\œŠ
+JNÂˆ\ÜÙ\JØ[YKZK˜Ú]ÜØÜ™Y[‹š\×Û›Û™J
+JNÂˆØ[YKœØÜ™Y[ˆHØÜ™Y[”^Z[™ÎÂˆ\ÜÙ\JØ[YK›Ü[—ØÚ]
+‹İŠKš\×ÛÚÊ
+JNÂˆ\ÜÙ\JØ[YKœØÜ™Y[ˆOHØÜ™Y[Ú]
+NÂˆ\ÜÙ\Ù\HJØ[YKZK˜Ú]ÜØÜ™Y[‹˜\×Ü™YŠ
+K[Ü˜\
+
+Kš[œ]˜[YK‹İŠNÂˆËÈHÚ]\ÈHØÜ™Y[ˆÛÎˆHÙXÛÛ™Ø[Ù\Û‰İ™\XÙHÚ]	ÜÈ\Y‚ˆ\ÜÙ\JØ[YK›Ü[—ØÚ]
+š[ÈŠKš\×Ù\œŠ
+JNÂˆ\ÜÙ\Ù\HJØ[YKZK˜Ú]ÜØÜ™Y[‹˜\×Ü™YŠ
+K[Ü˜\
+
+Kš[œ]˜[YK‹İŠNÂˆB‚ˆËËÈHXÚÙ]šY[™ÈÜ˜\]\İ™]Z[ˆ[š\ÚX›H[\›YYX\H[]Y\ËˆHİ\İÛBˆËËÈÚ]YÚ[ˆØ[ˆ\ÙH[ˆ\™XKYY™™XİÛİYÚÜÙHÙ\™\ˆÜÚ][ÛˆİÜÈ\][™ÂˆËËÈÚ[H]šY\ÈH^Y\‹Ú]H^Y\ˆÜˆX\šÙ\ˆİ[™\È]ÈİÛˆ\ÜÙ[™Ù\‹‚ˆÖİ\İBˆÖÚYÛ›Ü™HH›™YYÈ™\\™Y™\Ûİ\˜Ù\È[ˆÔ’V“Ó—ÕTÕÔ‘TÓÕTÑTÈ—Bˆ›ˆYÚ[—Ü^Y\—ÜİXÚ×Ù›ÛİÜ×Û™]ÛÜš×Û[İ™\×Ø[™ÛØØ[ØØ\œšY\œÊ
+HÂˆ\ÙHİ\\œİ\\Âˆ]Y[ËØ[YKÜ[ÛœË›ÙÜ™\ÜËÙ][™ÜË^Xİ][Û—Ü›ÛN‘^Xİ][Û”›ÛKØYÜ™\Ûİ\˜Ù\ËˆNÂˆ\ÙHÜš^›Û—ØÛY[Û[İ[Û”^Y\“[İ[Û‹Üš[’Ù^\ßNÂˆ\ÙHÜš^›Û—ØÛÜ™N™Ù[ÛY]N•™XÌÎÂˆ\ÙHÜš^›Û—Ü›İØÛÛœXÚÙ]Îœ^NÜÙ[‹ÛY[›İ[™\ÈßNÂˆ]›ÛİHİœ]”]Y™œ›ÛJİ™[˜\—ÛÜÊ’Ô’V“Ó—ÕTÕÔ‘TÓÕTÑTÈŠK[Ü˜\
+
+JNÂˆ]Ù][™ÜÈHÙ][™ÜÎ™Y˜][
+
+NÂˆ]ØYYHØYÜ™\Ûİ\˜Ù\ÊˆÜš^›Û—Ø\ÜÙ]Îœ™\Ûİ\˜ÙWÜÛİ\˜ÙN”™\Ûİ\˜ÙT›Ûİ™\™XİÜJ›Ûİ˜ÛÛ™J
+JKˆ™XÎ›™]Ê
+Kˆ›Û™Kˆ	œ›Ûİˆ	œÙ][™ÜËˆİ[YN’[œİ[››İÊ
+Kˆ˜[ÙKˆ^Xİ][Û”›ÛNÛY[ˆ	”›ÙÜ™\ÜÎ›™]Ê
+Kˆ	›]]Ëß[œ™XXÚX›HJ
+Kˆ
+Bˆ[Ü˜\
+
+NÂˆ]]]Ü[ÛœÈHÜ[ÛœÎœ\œÙJİš]\™[\J
+JK[Ü˜\
+
+K[Ü˜\
+
+NÂˆÜ[ÛœËœ™\Ûİ\˜Ù\ÈH›Ûİ˜ÛÛ™J
+NÂˆÜ[ÛœË™^Xİ][Û—Ü›ÛHH^Xİ][Û”›ÛNÛY[Âˆ]]]Ø[YHHØ[YN›™]Êˆ	›ØYYœ™\Ûİ\˜Ù\ËˆØYYœXÚËˆØYY™İZK[Ü˜\
+
+KˆÜ[ÛœËˆÙ][™ÜËˆ]Y[ÎœÚ[[
+	šÜš^›Û—Ø\ÜÙ]Îœ™\Ûİ\˜ÙWÜÛİ\˜ÙN”™\Ûİ\˜ÙTÛİ\˜ÙN™\™XİÜJˆ›Ûİ˜ÛÛ™J
+Kˆ
+JKˆ›Û™Kˆ
+Bˆ[Ü˜\
+
+NÂˆ]
+ÛY[ÜÙ\™\ŠHHÜš^›Û—Ü›İØÛÛ˜ÛÛ›™Xİ[Û”\NœZ\Š
+NÂˆØ[YK˜ÛÛ›™XİÛØØ[
+ÛY[”ÙX]\İŠK[Ü˜\
+
+NÂˆØ[YKœ™[[İK˜\×Û]]
+
+K[Ü˜\
+
+K™[]WÚYHÎÂˆØ[YKœ^Y\ˆHÛÛYJ^Y\“[İ[Û›™]ÊØ[YK›[İ[Û‹™XÌÎ–‘T“ÊK[Ü˜\
+
+JNÂˆØ[YKœÜ]Û—Ù[]J›Z[™XÜ˜Yœ^Y\ˆ‹Ì‹ŒŒËŒKÌŒÈ×JNÂˆØ[YKœÜ]Û—Ù[]JK›Z[™XÜ˜Yœ^Y\ˆ‹ÌŒŒŒKÌŒÈ×JNÂˆØ[YKœÜ]Û—Ù[]J‹›Z[™XÜ˜Y˜\™XWÙY™™XİØÛİY‹ÌŒÈ×KÌŒÈ×JNÂˆ]Ù]HÎˆ	›]]Ø[YO	×Ï‹™ZXÛK\ÜÙ[™Ù\œÎˆ™XÏLÌŸÂˆËš[™WÜXÚÙ]
+Î”Ù]\ÜÙ[™Ù\œÊ^N”Ù]\ÜÙ[™Ù\œÈÂˆ™ZXÛKˆ\ÜÙ[™Ù\œËˆJJBˆ[Ü˜\
+
+NÂˆNÂˆÙ]
+	›]]Ø[YK™XÈVÍ—JNÂˆÙ]
+	›]]Ø[YK‹™XÈVÍËWJNÂˆ]ÛÜÙHH]ˆ™XÌËˆNˆˆÂˆ\ÜÙ\Jˆ
+]H
+K˜XœÊ
+HYKMH	‰ˆ
+]HHJK˜XœÊ
+HYKMH	‰ˆ
+]ˆHŠK˜XœÊ
+HYKMKˆœÜÚ][ÛˆØ]ßK^XİYŞŞKŞ_KŞŸWH‚ˆ
+NÂˆNÂˆ\ÜÙ\JØ[YKœ™[[İWÜšYJÙ^\Î™Y˜][
+
+K
+K[Ü˜\
+
+JNÂˆÛÜÙJØ[YKœ^Y\‹˜\×Ü™YŠ
+K[Ü˜\
+
+KœÜÚ][Û‹‹ŒKËËŒ
+NÂˆÛÜÙJˆØ[YK›[ØœËš]\Š
+K™š[™
+_KšYOHJK[Ü˜\
+
+KœÜÚ][Û‹ˆ‹ŒˆKËˆËŒˆ
+NÂˆØ[YKš[™WÜXÚÙ]
+Î‘[]TÜÚ][Û”Ş[˜Ê^N‘[]TÜÚ][Û”Ş[˜ÈÂˆYˆˆ]ˆ^N”ÜÚ][Û”]“[™X\ŠÌL‹ŒËŒMŒJKˆX]ÎˆKŒˆ]ÚˆŒˆÛ—ÙÜ›İ[™ˆYKˆJJBˆ[Ü˜\
+
+NÂˆ›ÜˆÈ[ˆ‹ÂˆØ[YKXÚ×Ü™[[İWÙ[]Y\ÊYJNÂˆØ[YKœ™[[İWÜšYJÙ^\Î™Y˜][
+
+K
+K[Ü˜\
+
+NÂˆBˆÛÜÙJØ[YKœ^Y\‹˜\×Ü™YŠ
+K[Ü˜\
+
+KœÜÚ][Û‹L‹ŒËMŒ
+NÂˆÛÜÙJˆØ[YK›[ØœËš]\Š
+K™š[™
+_KšYOHJK[Ü˜\
+
+KœÜÚ][Û‹ˆL‹ŒˆËˆMŒˆ
+NÂˆËÈH[\›YYX\IÜÈXÚÙ]ÜÚ][Ûˆ]\İ™[XZ[ˆ[˜Ú[™ÙY›Üˆ™[]]™HXÛÙ[™Ë‚ˆ\ÜÙ\Ù\HJˆØ[YKœ™[[İK˜\×Ü™YŠ
+K[Ü˜\
+
+K˜XÚÙY
+ŠK[Ü˜\
+
+KŒKˆÌŒÈ×Bˆ
+NÂˆËÈH™[[İH^Y\ˆšY[™ÈHØØ[^Y\ˆ]\İ›ÛİÈİ\ˆİÛˆ[İ™[Y[ÛË‚ˆÙ]
+	›]]Ø[YK‹™XÈVÍWJNÂˆÙ]
+	›]]Ø[YKË™XÈVÍ—JNÂˆØ[YKœ^Y\‹˜\×Û]]
+
+K[Ü˜\
+
+KœÜÚ][ÛˆH™XÌÎ›™]ÊŒŒÌŒKŒ
+NÂˆØ[YKœÜÚ][Û—ÜšY\œÊ
+NÂˆÛÜÙJˆØ[YK›[ØœËš]\Š
+K™š[™
+_KšYOHJK[Ü˜\
+
+KœÜÚ][Û‹ˆŒŒˆÌKËˆKŒˆ
+NÂˆËÈH\™XİİXÚÈ\È›È[\›YYX\IÜÈKZZYÚÙ™œÙ]‚ˆÙ]
+	›]]Ø[YK™XÈVÍËWJNÂˆØ[YKœ™[[İWÜšYJÙ^\Î™Y˜][
+
+K
+K[Ü˜\
+
+NÂˆÛÜÙJØ[YKœ^Y\‹˜\×Ü™YŠ
+K[Ü˜\
+
+KœÜÚ][Û‹L‹ŒŒ‹MŒ
+NÂˆÛÜÙJˆØ[YK›[ØœËš]\Š
+K™š[™
+_KšYOHJK[Ü˜\
+
+KœÜÚ][Û‹ˆL‹ŒˆŒ‹ˆMŒˆ
+NÂˆËÈ™[[İš[™ÈHØ\œšY\ˆ]XÚ\È\ÜÙ[™Ù\œÈ]™[ˆÚ]İ]Hš[˜[[\HXÚÙ]‚ˆØ[YKœ™[[İ™WÙ[]J
+NÂˆ\ÜÙ\Ù\HJØ[YKœšY[™Ë›Û™JNÂˆ\ÜÙ\Ù\HJˆØ[YK›[ØœËš]\Š
+K™š[™
+_KšYOHJK[Ü˜\
+
+K™^˜K›[İ[ˆ›Û™Bˆ
+NÂˆB‚ˆËËÈ[]Kš\ĞÛÛY[™Ø[™HÛ˜\ÛY[]™[œŞ[˜Ğ›ØÚÔİ]XXZÙ\ÎˆBˆËËÈ›ØÚÈHÙ\™\ˆ]È˜XÚÈÚ\™HH^Y\ˆİ[™ÈÙ[™È]ÈBˆËËÈÜÚ][ÛˆH™YXİ[Ûˆ™[Y[X™\™Y[™H›ØÚÈ]ÛÛY\È˜XÚÈÛX\ˆÙ‚ˆËËÈH^Y\‹[ˆ[\HÛ™KÜˆÛ™HH^Y\ˆ\È™Y[ˆ[\ÜYÚ[˜ÙBˆËËÈX]™\È]Ú\™H]\Ë‚ˆÖİ\İBˆ›ˆWØ›ØÚ×İWÜÙ\™\—Ü]×Ø˜XÚ×ÜÛ˜\×İWÜ^Y\—Ûİ]ÛÙ—Ú]
+
+HÂˆ\ÙHÜš^›Û—ØÛÜ™N™Ù[ÛY]NĞXX˜‹™XÌË›Ş[Ú\_NÂˆËÈH^Y\ˆİ[™[™È[ˆ›ØÚÈ
+
+NˆˆÚYKK[‚ˆ]^Y\ˆHXX˜›™]Ê™XÌÎ›™]ÊŒ‹ŒŒŠK™XÌÎ›™]ÊK
+JNÂˆ]İX™HH›Ş[Ú\N˜›ØÚÊ
+NÂˆ\ÜÙ\JˆÚ\WÛYY]Ê	˜İX™KÌK^Y\ŠKˆH›ØÚÈH^Y\ˆ\Èİ[™[™È[ˆ‚ˆ
+NÂˆ\ÜÙ\J\Ú\WÛYY]Ê	˜İX™KÌ‹K^Y\ŠK˜X›İ™H]ÈXYŠNÂˆ\ÜÙ\Jˆ\Ú\WÛYY]Ê	˜İX™KÌKK^Y\ŠKˆH›ØÚÈ™\ÚYH]‚ˆ
+NÂˆ\ÜÙ\J\Ú\WÛYY]Ê	•›Ş[Ú\N™[\J
+KÌK^Y\ŠJNÂ‚ˆËÈHÛ˜\]Ù[ˆH™[Y[X™\™YÜÚ][Û‹[›\ÜÈH[\ÜØ[YHY\‚ˆËÈH™YXİ[Ûˆ
+\İ[\ÜÙ\]Y[˜ÙHÙ\]Y[˜ÙX
+K‚ˆ]]HÌKŒWNÂˆ\ÜÙ\Ù\HJÛ˜\İ\™Ù]
+]LKËYJKÛÛYJ]
+JNÂˆ\ÜÙ\Ù\HJÛ˜\İ\™Ù]
+]LKË˜[ÙJK›Û™K˜H›ØÚÈ]ÛX\œÈŠNÂˆ\ÜÙ\Ù\HJÛ˜\İ\™Ù]
+]ËËYJK›Û™K[\ÜY]ÈŠNÂˆ\ÜÙ\Ù\HJˆÛ˜\İ\™Ù]
+]‹ËYJKˆÛÛYJ]
+Kˆ[\ÜY™Y›Ü™H]‚ˆ
+NÂˆB‚ˆËËÈ][T^Y\‘Ø[YS[ÙK\ÙR][X	ÜÈÚİ[İÚ[™ØˆHÕPĞÑTÔÈ[œİÙ\œÂˆËËÈİÚ[™ËÓÓ”ÕSQIÜÈÈ›İ
+ÍJK‚ˆÖİ\İBˆ›ˆWİ›İÛ—Ú][WÜİÚ[™Ú[™×ÛÛ—ØWÜÙ\™\—Ø[™ØWØÚ\™ÙWÛ›İ
+
+HÂˆ]İXÚÈHYˆ	œİŸ][TİXÚÎ›™]ÊYJNÂˆËÈÕPĞÑTÔÎˆH›İØX›\ËHXÚÙ]H›Ø]H[™KH›ÛÚËHX\‚ˆ›ÜˆY[ˆÂˆ›Z[™XÜ˜Y™[™\—ÜX\›‹ˆ›Z[™XÜ˜YœÜ\ÚÜİ[Ûˆ‹ˆ›Z[™XÜ˜YÚ[™ØÚ\™ÙH‹ˆ›Z[™XÜ˜YœÛ›İØ˜[‹ˆ›Z[™XÜ˜Y™^\šY[˜ÙWØ›İH‹ˆ›Z[™XÜ˜Y˜XÚÙ]‹ˆ›Z[™XÜ˜Y›ØZ×Ø›Ø]‹ˆ›Z[™XÜ˜Y˜[™H‹ˆ›Z[™XÜ˜YÜš]X›WØ›ÛÚÈ‹ˆ›Z[™XÜ˜Y›X\‹ˆHÂˆ\ÜÙ\J™[[İWİ\ÙWÜİÚ[™ÜÊ	œİXÚÊY
+K˜[ÙJKÚYHİÚ[™ÜÈŠNÂˆBˆËÈÓÓ”ÕSQNˆHÚ\™Ù\È[™İ\\Ú[™Ò[œİ[IÜÈ\Ù\ËHš[šØX›BˆËÈİ[Ûˆ[[Û™È[H
+ÛÛœİ[XX›XÙ]
+K‚ˆ›ÜˆY[ˆÂˆ›Z[™XÜ˜Y˜›İÈ‹ˆ›Z[™XÜ˜Y˜Ü›ÜÜØ›İÈ‹ˆ›Z[™XÜ˜YšY[‹ˆ›Z[™XÜ˜YœÜYÛ\ÜÈ‹ˆ›Z[™XÜ˜Y™ÛØ]ÚÜ›ˆ‹ˆ›Z[™XÜ˜Y™[™\—Ù^YH‹ˆHÂˆ\ÜÙ\J\™[[İWİ\ÙWÜİÚ[™ÜÊ	œİXÚÊY
+K˜[ÙJKÚYHÙ\È›İİÚ[™ÈŠNÂˆBˆËÈHÚ[™]XÈÙX\ÛœÈÚ\™ÙHZÙHHšY[‚ˆ\ÜÙ\J\™[[İWİ\ÙWÜİÚ[™ÜÊ	œİXÚÊ›Z[™XÜ˜Yš\›Û—ÜÜX\ˆŠK˜[ÙJJNÂˆËÈHÛÛœİ[XX›H
+›ÛÙHš[šÊHİ\È]È\ÙHÚ]İ]HİÚ[™Ë‚ˆ\ÜÙ\J\™[[İWİ\ÙWÜİÚ[™ÜÊ	œİXÚÊ›Z[™XÜ˜Y˜\HŠKYJJNÂˆB‚ˆËËÈZ[™XÜ˜YXÚÎˆÓQS•ÕPÒ×ÑS‘Û›HÚ[HH]™[^\İËˆ›Û™H™Y›Ü™BˆËËÈHš\œİÙÚ[ˆ
+ÛÛ™šYİ\˜][Ûˆ\Èš[š\ÚYHÙ\™\ˆ\È›İXÙYˆËËÈH^Y\ˆY]
+K[™›Û™Hœ›ÛHİ\ÛÛ™šYİ\˜][Ûˆ[[H™^ÙÚ[‹‚ˆÖİ\İBˆ›ˆXÚ×Ù[™×Û™YYİWÛ]™[İWÛÙÚ[—ÛXZÙ\Ê
+HÂˆ\ÜÙ\JXÛY[Ú\×Û]™[
+˜[ÙK›Û™JKš›Ú[™YØZ][™È›ÜˆÙÚ[ˆŠNÂˆ\ÜÙ\JÛY[Ú\×Û]™[
+YK›Û™JK˜Y\ˆÙÚ[ˆŠNÂˆ\ÜÙ\JXÛY[Ú\×Û]™[
+YKÛÛYJ
+JKœ™XÛÛ™šYİ\š[™ÈŠNÂˆB‚ˆËËÈÌLŒMˆH›ŞH[İ™\ÈH^Y\ˆÈ]È™^Ù\™\‹ˆH\İÙ\™\‰ÜÂˆËËÈÛÛ[[œÈİ^H[[H™^ÙÚ[‹]™XÛÛ™šYİ\™Y[™XYH][ˆBˆËËÈ™^Ù\™\‰ÜÈš[ÛYHX›KÚÜ\ˆÚ[ˆÛ›HH\İÙ\™\ˆYBˆËËÈš[ÛYHHØ[YHXÚÜÎˆHÛÛ[[œÈÛ[ˆY\İ]
+H[ˆ\ÈÂˆËËÈ]H[™^\ÈÈŠKˆ˜[š[IÜÈÛX\ÛY[]™[X]™\È›È^Y\‹ÛÂˆËËÈÙ]Ú]X][Û˜[]\ÚXÈ\ÈQS•K[™Ù\™\”™XÛÛ™šYÔØÜ™Y[ˆ
+›ÂˆËËÈ]™[ØY[™ÔØÜ™Y[ŠH]È]\ÚXÓX[˜YÙ\‹XÚÈİ\]‚ˆÖİ\İBˆÖÚYÛ›Ü™HH›™YYÈ™\\™Y™\Ûİ\˜Ù\È[ˆÔ’V“Ó—ÕTÕÔ‘TÓÕTÑTÈ—Bˆ›ˆWÜ™XÛÛ™šYİ\š[™×ØÛY[Ü^\×ÛY[WÛ]\ÚX×Ø[™Û™]™\—Ú[™^\×Ü\İİWØš[ÛY\Ê
+HÂˆ\ÙHÜ˜]N™Ø[YNĞ]Y[ËØ[YKÜ[ÛœË›ÙÜ™\ÜËÙ][™ÜËØYÜ™\Ûİ\˜Ù\ßNÂˆ\ÙHÜš^›Û—ØÛY[ØÚ[šÎÚ[šË]\ÚXÎ“]\ÚXßNÂˆ\ÙHÜš^›Û—ØÛÜ™N™Ù[ÛY]N•™XÌÎÂˆ]›ÛİHİœ]”]Y™œ›ÛJˆİ™[˜\—ÛÜÊ’Ô’V“Ó—ÕTÕÔ‘TÓÕTÑTÈŠK™^Xİ
+œ™\\™Y™\Ûİ\˜Ù\È™\]Z\™YŠKˆ
+NÂˆ]Ù][™ÜÈHÙ][™ÜÎ™Y˜][
+
+NÂˆ]ØYYHØYÜ™\Ûİ\˜Ù\ÊˆÜš^›Û—Ø\ÜÙ]Îœ™\Ûİ\˜ÙWÜÛİ\˜ÙN”™\Ûİ\˜ÙT›Ûİ™\™XİÜJ›Ûİ˜ÛÛ™J
+JKˆ™XÎ›™]Ê
+Kˆ›Û™Kˆ	œ›Ûİˆ	œÙ][™ÜËˆİ[YN’[œİ[››İÊ
+Kˆ˜[ÙKˆÜ˜]N™Ø[YN™^Xİ][Û—Ü›ÛN‘^Xİ][Û”›ÛNÛY[ˆ	”›ÙÜ™\ÜÎ›™]Ê
+Kˆ	›]]Ëß[œ™XXÚX›HJ
+Kˆ
+Bˆ[Ü˜\
+
+NÂˆ]]]Ü[ÛœÈHÜ[ÛœÎœ\œÙJİš]\™[\J
+JK[Ü˜\
+
+K[Ü˜\
+
+NÂˆÜ[ÛœËœ™\Ûİ\˜Ù\ÈH›Ûİ˜ÛÛ™J
+NÂˆ]]]Ø[YHHØ[YN›™]Êˆ	›ØYYœ™\Ûİ\˜Ù\ËˆØYYœXÚËˆØYY™İZK[Ü˜\
+
+KˆÜ[ÛœËˆÙ][™ÜËˆ]Y[ÎœÚ[[
+	šÜš^›Û—Ø\ÜÙ]Îœ™\Ûİ\˜ÙWÜÛİ\˜ÙN”™\Ûİ\˜ÙTÛİ\˜ÙN™\™XİÜJˆ›Ûİ˜ÛÛ™J
+Kˆ
+JKˆ›Û™Kˆ
+Bˆ[Ü˜\
+
+NÂˆØ[YKš[š]Ü™[[İWÙ›Ü—Ü™\^J
+K[Ü˜\
+
+NÂˆËÈH\İÙ\™\‰ÜÈÛÛ[[ˆ]HÜšYÚ[ˆ]È^˜Hš[ÛYHØ[YHY\‚ˆËÈHZ[Z[ˆÛ™\ËÛ™H\İHX›HH™^Ù\™\ˆX]™\Ë‚ˆ]İ[HHÛÜ›Øš[ÛY\ÈJØ[YJK›\İ›[Š
+H\ÈLMÂˆ]]]ÛÛ[[ˆHÚ[šÎ™[\J
+NÂˆËÈ]X\MˆX›İ™HHÛÛ[[‰ÜÈ›İÛH]Mˆ›ØÚÈH‚ˆÛÛ[[‹œÙ]Øš[ÛYWØÙ[
+M‹İ[JNÂˆØ[YKÛÜ›ˆ˜Ú[šÜÂˆš[œÙ\
+
+
+KİœŞ[˜Î\˜Î›™]ÊÛÛ[[ŠJNÂˆ\ÜÙ\Ù\HJØ[YK˜š[ÛYWØ]
+ÌŒÈ×JK›Z[™XÜ˜YœZ[œÈŠNÂˆ\ÜÙ\Ù\HJˆØ[YK˜š[ÛYWÛ˜[YWØ]
+™XÌÎ›™]ÊKKJJK˜\×Ù\™YŠ
+KˆÛÛYJ›Z[™XÜ˜YœZ[œÈŠBˆ
+NÂ‚ˆËÈİ\ÛÛ™šYİ\˜][ÛˆY\ˆHÙÚ[ˆ›È^Y\‹Ù\™\”™XÛÛ™šYÔØÜ™Y[‹‚ˆ]XÚÜÈHØ[YKXÚÜÎÂˆ]ˆHØ[YKœ™[[İK˜\×Û]]
+
+K[Ü˜\
+
+NÂˆ‹›ÙÙÙYÚ[ˆHYNÂˆ‹œ™XÛÛ™šYİ\š[™ÈHÛÛYJXÚÜÊNÂˆØ[YKœ^Y\ˆH›Û™NÂˆ\ÜÙ\Ù\HJØ[YKœÚ]X][Û˜[Û]\ÚXÊ
+KŒÛÛYJ]\ÚXÎ›Y[J
+JJNÂˆËÈH™]ÈX[˜YÙ\ˆØZ]È]Èš\œİLXÚÜË[ˆİ\ÈHY[H˜XÚË‚ˆ]Y[HH
+‹LL
+K˜[JßÂˆØ[YKXÚ×Û]\ÚXÊ
+NÂˆØ[YK›]\ÚXË˜İ\œ™[
+	™Ø[YK˜]Y[Ë™[™Ú[™JHOHÛÛYJ›Z[™XÜ˜Y›]\ÚXË›Y[HŠBˆJNÂˆ\ÜÙ\JY[KHY[H]\ÚXÈİ\È[™\ˆÙ\™\”™XÛÛ™šYÔØÜ™Y[ˆŠNÂ‚ˆËÈÚ]H]™[YØZ[ˆHØ[Y\˜H›Ø™H™XYÈ]ÛÛ[[ˆZ[œÉÈ]\ÚXË‚ˆØ[YKœ™[[İK˜\×Û]]
+
+K[Ü˜\
+
+Kœ™XÛÛ™šYİ\š[™ÈH›Û™NÂˆ]
+]\ÚXËÊHHØ[YKœÚ]X][Û˜[Û]\ÚXÊ
+NÂˆ\ÜÙ\J]\ÚXËš\×ÜÛÛYWØ[™
+_HOH]\ÚXÎ›Y[J
+JJNÂˆB‚ˆËËÈHÙ\™\‰ÜÈÛ‹Yš\™H›YÈÙY\ÈH™YXİYÛİ[İÛˆ
+ÚXÚˆËËÈ›ZYØ˜\ÙWİXÚØ[œÈİÛŠHœ›ÛH[™[™ÈHš\™NÈHÛX\ˆ›YÈX]™\ÂˆËËÈHÚ[™İÉÜÈİÛˆÛÛXİš\™H[Û™K‚ˆÖİ\İBˆ›ˆWÜÙ\™\œ×Ùš\™WÙ›Y×ÚÛ×İWØ\›š[™×Üİ]Wİ›İYÚİWØÛİ[İÛŠ
+HÂˆ]]]XÚÜÈHNÂˆ›ÜˆÈ[ˆ‹HÂˆXÚÜÈHÛÜÙ\™\—Ùš\™JXÚÜÈHKYJNÂˆ\ÜÙ\JXÚÜÈˆœİ[\›š[™ÈŠNÂˆBˆ\ÜÙ\Ù\HJÛÜÙ\™\—Ùš\™JÌYJKÌ˜HÛ™Ù\ˆš\™H\È›İİ]ŠNÂˆ\ÜÙ\Ù\HJÛÜÙ\™\—Ùš\™JË˜[ÙJKËœ™YXİY]˜Hš\™Hİ^\ÈŠNÂˆ\ÜÙ\Ù\HJÛÜÙ\™\—Ùš\™J˜[ÙJK
+NÂˆB‚ˆÖİ\İBˆ›ˆWØ™XXÛÛ—İ\]WİY×ÚÙY\×İWØ™X[WİWØÛY[İØ[ÙY
+
+HÂˆ]ÛH›ØÚÑ[]N™XXÛÛŠ›Ş›™]Ê™XXÛÛˆÂˆ]™[ÎˆKˆš[X\NˆÛÛYJ›Z[™XÜ˜YœÜYY‹š[Ê
+JKˆÙXİ[ÛœÎˆ™XÈVÊQ‘‘‘KŠWKˆÚXÚÚ[™Îˆ™XÈVÊQ‘‘‘KJWKˆ\İØÚXÚ×ŞNˆÌˆ‹‘Y˜][™Y˜][
+
+BˆJJNÂˆËÈ™XXÛÛ›ØÚÑ[]K™Ù]\]UYÎˆØ]™Pİ\İÛSÛ›K‚ˆ]YÈHYÎ˜ÛÛ\İ[™
+Âˆ
+šY‹YÎ”İš[™Ê›Z[™XÜ˜Y˜™XXÛÛˆ‹š[Ê
+JJKˆ
+‹YÎ’[
+
+JKˆ
+H‹YÎ’[
+
+JKˆ
+ˆ‹YÎ’[
+
+JKˆ
+œš[X\WÙY™™Xİ‹YÎ”İš[™Ê›Z[™XÜ˜Yš\İH‹š[Ê
+JJKˆ
+ˆœÙXÛÛ™\WÙY™™Xİ‹ˆYÎ”İš[™Ê›Z[™XÜ˜Yœ™YÙ[™\˜][Ûˆ‹š[Ê
+JKˆ
+Kˆ
+“]™[È‹YÎ’[
+
+JKˆJNÂˆ]
+Ë]]™]ÊHHÜš^›Û—ØÛY[œØ]™N™XÛÙWØ›ØÚ×Ù[]J	YÊK[Ü˜\
+
+NÂˆÙY\ØÛY[Üİ]JÛÛYJ	›Û
+K	›]]™]ÊNÂˆ]›ØÚÑ[]N™XXÛÛŠŠHH™]È[ÙHÂˆ[šXÈJ››İH™XXÛÛˆŠNÂˆNÂˆ\ÜÙ\Ù\HJ‹œÙXİ[ÛœË™XÈVÊQ‘‘‘KŠWJNÂˆ\ÜÙ\Ù\HJ‹˜ÚXÚÚ[™Ë™XÈVÊQ‘‘‘KJWJNÂˆ\ÜÙ\Ù\HJ‹›\İØÚXÚ×ŞKÌ
+NÂˆËÈHİÙ\œÈ\™HHYÉÜÎÈH]™[Èİ^HHÛY[	ÜÈİÛˆ
+›İ™XY
+K‚ˆ\ÜÙ\Ù\HJ‹œš[X\K˜\×Ù\™YŠ
+KÛÛYJ›Z[™XÜ˜Yš\İHŠJNÂˆ\ÜÙ\Ù\HJ‹œÙXÛÛ™\K˜\×Ù\™YŠ
+KÛÛYJ›Z[™XÜ˜Yœ™YÙ[™\˜][ÛˆŠJNÂˆ\ÜÙ\Ù\HJ‹›]™[ËJNÂˆB‚ˆÖİ\İBˆ›ˆWÜÙ\™\—ÜİÜ[™×İWİ\ÙWÛİÙ\œ×İWÜÚY[
+
+HÂˆËÈ^Y\‹™\ØX›TÚY[	ÜÈİÜ\Ú[™Ò][Nˆ›YÜÈÜˆˆÚ[HBˆËÈÙ™‹Z[™ÚY[\È˜Z\ÙY
+ØØ[^Y\‹›Û”Ş[˜ÙY]U\]Y8¡¤‚ˆËÈİÜ\Ú[™Ò][JKˆİÜ\Ú[™Ò][HÛX\œÈš][™X]™\Èš]KÛÈBˆËÈXZ[‹Z[™İÜ\È[™[ˆÙ™‹Z[™İÜ\È‹‚ˆ]Ù™ˆHİ\\œİ\\œÚY[“Ñ‘’S‘ÔÓÕÂˆ\ÜÙ\Ù\HJŞ[˜ÙYÛØØ[İ\ÙJÛÛYJ
+Ù™‹LŠJKËßYJK›Û™JNÂˆ\ÜÙ\Ù\HJŞ[˜ÙYÛØØ[İ\ÙJÛÛYJ
+ËJJKËßYJK›Û™JNÂˆ\ÜÙ\Ù\HJŞ[˜ÙYÛØØ[İ\ÙJÛÛYJ
+Ù™‹LŠJK‹ËßYJK›Û™JNÂˆB‚ˆÖİ\İBˆ›ˆWÜÙ\™\—Üİ\[™×ØWİ\ÙWÜİ\×Ú]Ú[—İ]Ú[™
+
+HÂˆ]Ù™ˆHİ\\œİ\\œÚY[“Ñ‘’S‘ÔÓÕÂˆ\ÜÙ\Ù\HJŞ[˜ÙYÛØØ[İ\ÙJ›Û™KKßYJKÛÛYJ
+
+JJNÂˆ\ÜÙ\Ù\HJŞ[˜ÙYÛØØ[İ\ÙJ›Û™KËßYJKÛÛYJ
+Ù™‹
+JJNÂˆËÈ]š[™Ñ[]Kœİ\\Ú[™Ò][H™YYÈ[ˆ][H[ˆH[™‚ˆ\ÜÙ\Ù\HJŞ[˜ÙYÛØØ[İ\ÙJ›Û™KKß˜[ÙJK›Û™JNÂˆB‚ˆËËÈÛĞšYÕÒ[\œÛ]NˆHÜÚ][ÛˆŞ[˜ÈYX\İ\™\Èœ›ÛHÚ\™HH[]BˆËËÈ\ËH[\Üœ›ÛHÚ\™H]È[\œÛ][Ûˆ\ÈXYY‚ˆÖİ\İBˆ›ˆWÙ˜\—Û[İ™WÜÛ˜\×ØWİWÜXÚÙ]×ÛİÛ—ÛYX\İ\™J
+HÂˆ\ÙHİ\\Ó[İ™TXÚÙ]]ÜÔ›İİ\Y[\œÛ][ÛŸNÂˆ]]HˆÜÔ›İÂˆÜÚ][ÛˆŞŒŒKˆX]ÎˆŒˆ]ÚˆŒˆNÂˆ]]][™\ˆHİ\Y[\œÛ][Û›™]ÊÊNÂˆËÈ]XYY›ÜˆL‚ˆ[™\‹š[\œÛ]WİÊ]
+Œ
+KÛÛYJ]“[™X\ŠÍLŒŒŒJJK›Û™JNÂˆ]ÈHÌLŒŒŒNÂˆ\ÜÙ\J[İ™TXÚÙ]”ÜÚ][Û”Ş[˜ËœÛ˜\Ê	š[™\‹]
+Œ
+KÊJNÂˆ\ÜÙ\JS[İ™TXÚÙ]•[\ÜœÛ˜\Ê	š[™\‹]
+Œ
+KÊJNÂˆ\ÜÙ\JS[İ™TXÚÙ]“[İ™KœÛ˜\Ê	š[™\‹]
+Œ
+KÊJNÂˆËÈÚ]›İ[™È[ˆ›YÚ›İYX\İ\™Hœ›ÛHH[]K‚ˆ]YHHİ\Y[\œÛ][Û›™]ÊÊNÂˆ\ÜÙ\J[İ™TXÚÙ]•[\ÜœÛ˜\Ê	šYK]
+Œ
+KÊJNÂˆ\ÜÙ\JS[İ™TXÚÙ]•[\ÜœÛ˜\Ê	šYK]
+Œ
+KÍŒŒŒŒJJNÂˆB‚ˆËËÈH˜\ˆŞ[˜È]ÈH[]H\™H[™›ÜÈHİ\È]Ø\ÈØ[Ú[™ÎÂˆËËÈH›İ][Ûˆ[Û™HÙY\ÈHÜÚ][Ûˆ]\ÈXYY›Üˆ[™\›œÈ\™BˆËËÈİ™\ˆH\]H[\˜[‚ˆÖİ\İBˆ›ˆWÛ]š[™×Ù[]\×Û[İ™WÜÛ˜\×ÛÜ—Üİ\Ê
+HÂˆ\ÙHİ\\Ó[İ™TXÚÙ]]ÜÔ›İİ\Y[\œÛ][Û‹İ\YÛ[İ™_NÂˆ]]HˆX]ÎˆŒÌŸÜÔ›İÂˆÜÚ][ÛˆŞŒŒKˆX]Ëˆ]ÚˆŒˆNÂˆ]]][™\ˆHİ\Y[\œÛ][Û›™]ÊÊNÂˆËÈØ[Ú[™ÈÈHÚ[ˆH˜\ˆŞ[˜ÈÛÛY\Ë‚ˆ[™\‹š[\œÛ]WİÊ]
+ŒŒ
+KÛÛYJ]“[™X\ŠÍKŒŒŒJJK›Û™JNÂˆ\ÜÙ\J[™\‹˜Xİ]™J
+JNÂˆ]˜\ˆHÌLŒŒŒNÂˆ]Û˜\Hİ\YÛ[İ™Jˆ	›]][™\‹ˆ[İ™TXÚÙ]”ÜÚ][Û”Ş[˜Ëˆ]
+ŒŒ
+Kˆ˜\‹ˆÛÛYJ]“[™X\Š˜\ŠJKˆÛÛYJ
+LŒŒ
+JKˆ
+NÂˆ\ÜÙ\Ù\HJÛ˜\ÛÛYJ]
+LŒLŒ
+JJNÂˆ\ÜÙ\JZ[™\‹˜Xİ]™J
+JNÂˆ\ÜÙ\Ù\HJ[™\‹š[\œÛ]J
+K›Û™K››Èİ\˜XÚÈİØ\™HŠNÂˆËÈH›İ][Û‹[Û›H[İ™HXÚÙ]‚ˆ]\›ˆHİ\YÛ[İ™Jˆ	›]][™\‹ˆ[İ™TXÚÙ]“[İ™Kˆ]
+LŒLŒ
+Kˆ˜\‹ˆ›Û™KˆÛÛYJ
+NŒŒ
+JKˆ
+NÂˆ\ÜÙ\Ù\HJ\›‹›Û™JNÂˆ]İ\Îˆ™XÏÏˆHİš]\™œ›ÛWÙ›Š[™\‹š[\œÛ]J
+JK˜ÛÛXİ
+
+NÂˆ\ÜÙ\Ù\HJˆİ\Ëš]\Š
+K›X\
+ßËX]ÊK˜ÛÛXİ™XÏÏŠ
+KˆÌLŒŒMLŒNŒBˆ
+NÂˆ\ÜÙ\Jİ\Ëš]\Š
+K˜[
+ßËœÜÚ][ÛˆOH˜\ŠJNÂˆB‚ˆÖİ\İBˆ›ˆX]Ú[™×Ù›YÜ×ÛX]™WØWÜ[›š[™×İ\ÙWØ[Û™J
+HÂˆ\ÜÙ\Ù\HJŞ[˜ÙYÛØØ[İ\ÙJÛÛYJ
+‹ÊJKK‹ßYJKÛÛYJ
+‹ÊJJNÂˆ\ÜÙ\Ù\HJŞ[˜ÙYÛØØ[İ\ÙJ›Û™K‹ßYJK›Û™JNÂˆB‚ˆËËÈÚ]\K›İ[™™XÛÜ˜]X[™XÛÜ˜]S˜\œ˜][Û˜ˆHš]˜]HY\ÜØYÙBˆËËÈÚİÜÈ\È”İ]™HÚ\Ü\œÈÈ[İNˆHˆ[™\È˜\œ˜]Y”İ]™HØ^\ÈHÂˆËËÈHÚ]\HH™YÚ\İHXÚÜÈ\ÈZ[™XÜ˜Y˜Ú]	ÜË‚ˆÖİ\İBˆ›ˆÚ]Ú\×Û˜\œ˜]YİÚ]Ú]×ØÚ]İ\\×Û˜\œ˜][Û—ÙXÛÜ˜][ÛŠ
+HÂˆ\ÙHİ\\ÑXÛÜ˜][Û‹Ú]İ\WÙXÛÜ˜]K^_NÂˆ\ÙHÜš^›Û—ØÛÜ™N›˜Ò˜]˜Tİš[™ËYË\œÙWÜÛ˜NÂˆ\ÙHÙ\™WÚœÛÛšœÛÛÂˆ]›İ[™H^NÚ]\P›İ[™ÂˆÚ]İ\Nˆˆ˜[YNˆYÎ”İš[™Ê˜]˜Tİš[™Î™œ›ÛJ”İ]™HŠJKˆ\™Ù]ˆ›Û™KˆNÂˆ]ÛÛ[HœÛÛˆJšHŠNÂˆ]
+[˜ÛÛZ[™ËÊHH\œÙWÜÛ˜
+ˆˆÈØÚ]İ˜[œÛ][Û—ÚÙ^Nˆ˜ÛÛ[X[™Ë›Y\ÜØYÙK™\Ü^Kš[˜ÛÛZ[™È‹\˜[Y]\œÎ–ÈœÙ[™\ˆ‹˜ÛÛ[—Kİ[NØÛÛÜˆ™Ü˜^H‹][XÎŒXŸ_K˜\œ˜][Ûİ˜[œÛ][Û—ÚÙ^Nˆ˜Ú]\K^›˜\œ˜]H‹\˜[Y]\œÎ–ÈœÙ[™\ˆ‹˜ÛÛ[—__HˆËˆ
+Bˆ[Ü˜\
+
+NÂˆ]Ú]HÚ]İ\WÙXÛÜ˜]JÛÛYJ	š[˜ÛÛZ[™ÊKXÛÜ˜][ÛÚ]	˜›İ[™	˜ÛÛ[
+NÂˆ\ÜÙ\Ù\HJÚ]È˜[œÛ]H—K˜ÛÛ[X[™Ë›Y\ÜØYÙK™\Ü^Kš[˜ÛÛZ[™ÈŠNÂˆ\ÜÙ\Ù\HJÚ]È˜ÛÛÜˆ—K™Ü˜^HŠNÂˆ\ÜÙ\Ù\HJÚ]ÈÚ]—KœÛÛˆJÈ”İ]™H‹šH—JJNÂˆ\ÜÙ\Ù\HJˆÚ]İ\WÙXÛÜ˜]JÛÛYJ	š[˜ÛÛZ[™ÊKXÛÜ˜][Û“˜\œ˜][Û‹	˜›İ[™	˜ÛÛ[
+KˆœÛÛˆJÈ˜[œÛ]Hˆ˜Ú]\K^›˜\œ˜]H‹Ú]ˆÈ”İ]™H‹šH—_JBˆ
+NÂˆ\ÜÙ\Ù\HJˆÚ]İ\WÙXÛÜ˜]J›Û™KXÛÜ˜][Û“˜\œ˜][Û‹	˜›İ[™	˜ÛÛ[
+KˆœÛÛˆJÈ˜[œÛ]Hˆ˜Ú]\K^›˜\œ˜]H‹Ú]ˆÈ”İ]™H‹šH—_JBˆ
+NÂˆ\ÜÙ\Ù\HJˆÚ]İ\WÙXÛÜ˜]J›Û™KXÛÜ˜][ÛÚ]	˜›İ[™	˜ÛÛ[
+VÈ˜[œÛ]H—Kˆ˜Ú]\K^‚ˆ
+NÂˆB‚ˆËËÈHØ][›Û‰ÜÈš[]™[\ÈH\ÙH\ÈÛY[™YXİË[™HİY\İ	ÜÂˆËËÈÜİ›ÜØ\™È]ÈÛİ[™ˆ]™\HØ][›Ûˆİ]HÛİ[Ë›İÛ›HBˆËËÈÛÜœÈ[™]™\œË‚ˆÖİ\İBˆ›ˆ]™\WØØ][›Û—ØÛİ[×Ø\×Ú[™ÛÜ\˜]Y
+
+HÂˆ›Üˆ˜[YH[ˆÂˆ›Z[™XÜ˜Y˜Ø][›Ûˆ‹ˆ›Z[™XÜ˜YØ]\—ØØ][›Ûˆ‹ˆ›Z[™XÜ˜Y›]˜WØØ][›Ûˆ‹ˆ›Z[™XÜ˜YœİÙ\—ÜÛ›İ×ØØ][›Ûˆ‹ˆHÂˆ\ÜÙ\Jİ\\š[™ÛÜ\˜]Y
+˜[YJKÛ˜[Y_HŠNÂˆBˆ\ÜÙ\J\İ\\š[™ÛÜ\˜]Y
+›Z[™XÜ˜YØ]\ˆŠJNÂˆB‚ˆËËÈ[ˆ”ÈYÚ[ˆ\İÈH”ËÜ]ÛœÈ][™ZÙ\ÈH[HÙ™ˆH\İ‚ˆËËÈH[]HÙY\ÈHÚÚ[ˆ]›İ[™ÈH^Y\ˆÜ]Û™Y™Y›Ü™H]È[BˆËËÈ\œš]™\ÈZÙ\ÈH[HÛ˜ÙH]ÛÛY\Ë‚ˆÖİ\İBˆ›ˆWÜ^Y\—Ù[]WÚÙY\×İWÜÚÚ[—Ú]×Ù[WÙØ]™J
+HÂˆ\ÙHÜš^›Û—ØÛY[œÚÚ[œÎ•^\™\ÎÂˆ\ÙHİ˜ÛÛXİ[ÛœÎ’\ÚX\Âˆ]œÈH^\™\ÈÂˆÚÚ[ˆÛÛYJš‹Ëİ^\™\Ë›Z[™XÜ˜Y›™]İ^\™KÛœÈ‹š[Ê
+JKˆÚYÛ™YˆYKˆ‹•^\™\Î™Y˜][
+
+BˆNÂˆ]
+]]\İY]]Ù\
+HH
+\ÚX\™œ›ÛJÊİLLœË˜ÛÛ™J
+JWJK\ÚX\›™]Ê
+JNÂˆ]]]^Y\œÈH\ÚX\™œ›ÛJÊšLÌ‹İLL
+K
+Ë
+WJNÂˆ\ÜÙ\Ù\HJˆİ\\œÚÚ[—Ù[šY\Ê	œ^Y\œË	›\İY	›]]Ù\
+KˆÊËœË˜ÛÛ™J
+JWBˆ
+NÂˆ\İYœ™[[İ™J	ÊNÂˆ\ÜÙ\Ù\HJˆİ\\œÚÚ[—Ù[šY\Ê	œ^Y\œË	›\İY	›]]Ù\
+KˆÊËœË˜ÛÛ™J
+JWBˆ
+NÂˆËÈ^Y\ˆ	ÜÈ[HÛÛY\ÈY\ˆ]È[]K‚ˆ]]HH^\™\ÈÂˆÚÚ[ˆÛÛYJš‹Ëİ^\™\Ë›Z[™XÜ˜Y›™]İ^\™KÛ]H‹š[Ê
+JKˆ‹›œË˜ÛÛ™J
+BˆNÂˆ\İYš[œÙ\
+]K˜ÛÛ™J
+JNÂˆ]]][šY\ÈHİ\\œÚÚ[—Ù[šY\Ê	œ^Y\œË	›\İY	›]]Ù\
+NÂˆ[šY\ËœÛÜØWÚÙ^J
+KÊ_
+JNÂˆ\ÜÙ\Ù\HJ[šY\ËÊËœÊK
+]JWJNÂˆËÈH™[[İ™Y[]H›Ü™Ù]È]È›Ùš[HÚ]]‚ˆ^Y\œËœ™[[İ™J	ŒŠNÂˆÙ\œ™[[İ™J	ŒŠNÂˆ\İY˜ÛX\Š
+NÂˆ\ÜÙ\Ù\HJİ\\œÚÚ[—Ù[šY\Ê	œ^Y\œË	›\İY	›]]Ù\
+K›[Š
+KJNÂˆB‚ˆÖİ\İBˆ›ˆX—ÜX›XØ][Û—Ùš[™Ù\œš[İ˜XÚÜ×Ø[Ú[œ]Ê
+HÂˆ]š[™Ù\œš[HYÎˆ	–İLLKÚÚ[œË]\ßÂˆ
+ˆYË›[Š
+KˆYËš]\Š
+K™›Û
+Ü‹]ZYÜˆˆ]ZY
+KˆÚÚ[œËˆ]\Ëˆ
+BˆNÂˆ]X›\ÚYHš[™Ù\œš[
+	–ÍËKKŠNÂˆ\ÜÙ\Ù\HJX›\ÚYš[™Ù\œš[
+	–Î×KKŠJNÂˆ\ÜÙ\Û™HJX›\ÚYš[™Ù\œš[
+	–ÍËWKKŠJNÂˆ\ÜÙ\Û™HJX›\ÚYš[™Ù\œš[
+	–ÍËK‹ŠJNÂˆ\ÜÙ\Û™HJX›\ÚYš[™Ù\œš[
+	–ÍËKKÊJNÂˆB‚ˆÖİ\İBˆ›ˆX—ÛØš™XİÜÚÚ[—ÜX›XØ][Û—İ˜XÚÜ×ØÚ[™Ù\×Ø[™Ø]\×ØÛX\Š
+HÂˆ]]]X›\ÚYHİ˜ÛÛXİ[ÛœÎ’\ÚX\›™]Ê
+NÂˆ]]]Üš]\ÈHÂˆ›ÜˆÚÚ[ˆ[ˆÈœÚÚ[œËÙš\œİ‹œÚÚ[œËÙš\œİ‹œÚÚ[œËÜÙXÛÛ™—HÂˆ›ÜˆÙ^H[ˆÈšYÈ‹›˜[YNœ^Y\ˆ—HÂˆYˆİ\\›Øš™XİÜÚÚ[—ØÚ[™ÙY
+	œX›\ÚYÙ^KÚÚ[ŠHÂˆX›\ÚYš[œÙ\
+Ù^K×ÛİÛ™Y
+
+KÚÚ[‹×ÛİÛ™Y
+
+JNÂˆÜš]\È
+ÏHNÂˆBˆBˆBˆ\ÜÙ\Ù\HJÜš]\Ë[˜Ú[™ÙYÚÚ[œÈÈ›İX›\ÚZ]\ˆ[HŠNÂˆX›\ÚY˜ÛX\Š
+NÂˆ\ÜÙ\Jİ\\›Øš™XİÜÚÚ[—ØÚ[™ÙY
+ˆ	œX›\ÚYˆšYÈ‹ˆœÚÚ[œËÜÙXÛÛ™‚ˆ
+JNÂˆ\ÜÙ\Jİ\\›Øš™XİÜÚÚ[—ØÚ[™ÙY
+ˆ	œX›\ÚYˆ›˜[YNœ^Y\ˆ‹ˆœÚÚ[œËÜÙXÛÛ™‚ˆ
+JNÂˆB‚ˆËËÈ[ˆ”ÈYÚ[‰ÜÈØØ[NˆH˜\ÙHHYÚ[ˆÙ]ËÜˆH[ÙYšY\ˆÛˆK‚ˆÖİ\İBˆ›ˆ]šX]Wİ˜[Y\×ØYİ[—Û][\WØ\×İ˜[š[J
+HÂˆ\ÙHÜš^›Û—Ü›İØÛÛœXÚÙ]Îœ^NĞ]šX]S[ÙYšY\‹]šX]TÛ˜\ÚİNÂˆ][ÙYšY\ˆH[[İ[Ü\˜][ÛŸ]šX]S[ÙYšY\ˆÂˆYˆ›Z[™XÜ˜Yœ›ÛÙˆ‹š[Ê
+Kˆ[[İ[ˆÜ\˜][Û‹ˆNÂˆ]Û˜\ÚİH˜\ÙK[ÙYšY\œß]šX]TÛ˜\ÚİÂˆ]šX]Nˆˆ˜\ÙKˆ[ÙYšY\œËˆNÂˆ\ÜÙ\Ù\HJİ\\œÛ˜\Úİİ˜[YJ	œÛ˜\Úİ
+‹Œ™XÈV×JJK‹Œ
+NÂˆ\ÜÙ\Ù\HJˆİ\\œÛ˜\Úİİ˜[YJ	œÛ˜\Úİ
+KŒ™XÈVÛ[ÙYšY\ŠKŒ
+WJJKˆ‹Œˆ
+NÂˆËÈ
+H
+ÈJH
+ˆ
+H
+ÈJHœ›ÛHH˜\ÙK[ˆ
+ˆ
+H
+ÈJHÙˆHİ[‚ˆ][H™XÈVÛ[ÙYšY\ŠKŒ
+K[ÙYšY\ŠKJK[ÙYšY\ŠKŒŠWNÂˆ\ÜÙ\Ù\HJİ\\œÛ˜\Úİİ˜[YJ	œÛ˜\Úİ
+KŒ[
+JK‹Œ
+NÂˆB‚ˆ\ÙHİ\\‘Ø[YNÂ‚ˆËËÈ[]K›ÛÚĞ]ˆX]È˜XÙ\È
+Ö‹NL˜XÙ\È
+ÖÈ]ÚNLÛÚÜÈ\‚ˆÖİ\İBˆ›ˆÛÚ×Ø]İ\›œ×İİØ\™×İWİ\™Ù]
+
+HÂˆ]ÛÜÙHH
+X]Ë]Ú
+Nˆ
+ŒÌ‹ŒÌŠKØ[ˆ
+ŒÌ‹ŒÌŠ_Âˆ\ÜÙ\Jˆ
+X]ÈHØ[Œ
+K˜XœÊ
+HYKLÈ	‰ˆ
+]ÚHØ[ŒJK˜XœÊ
+HYKLËˆŞX]ßHÜ]ÚKØ[İØ[ßH‚ˆ
+NÂˆNÂˆ]]HÌLŒŒMKŒNÂˆ]Ù™ˆHˆÙÈ×_Ø]ÌH
+ÈÌK]ÌWH
+ÈÌWK]Ì—H
+ÈÌ—WNÂˆÛÜÙJˆİ\\›ÛÚ×Ø]Ü›İ][ÛŠ]Ù™ŠÌŒŒËŒJJKˆ
+ŒŒ
+Kˆ
+NÂˆÛÜÙJˆİ\\›ÛÚ×Ø]Ü›İ][ÛŠ]Ù™ŠÌËŒŒŒJJKˆ
+NLŒŒ
+Kˆ
+NÂˆÛÜÙJˆİ\\›ÛÚ×Ø]Ü›İ][ÛŠ]Ù™ŠËLËŒŒŒJJKˆ
+LŒŒ
+Kˆ
+NÂˆÛÜÙJˆİ\\›ÛÚ×Ø]Ü›İ][ÛŠ]Ù™ŠÌŒŒLËŒJJKˆ
+LNŒŒ
+Kˆ
+NÂˆÛÜÙJˆİ\\›ÛÚ×Ø]Ü›İ][ÛŠ]Ù™ŠÌŒ‹Œ‹ŒJJKˆ
+ŒMKŒ
+Kˆ
+NÂˆÛÜÙJˆİ\\›ÛÚ×Ø]Ü›İ][ÛŠ]Ù™ŠÌŒMŒŒJJKˆ
+ŒKŒ
+Kˆ
+NÂˆB‚ˆËËÈ[™S[İ™T^Y\˜[İ™\ÈH^Y\‰ÜÈ]Ú[™H[Ù[	ÜÈÛ]ÚˆËËÈ
+›İØ
+H[ZÙNˆH™[]]™HÚ[™ÙHÙY\ÈHX\ÙHHXÚÈ™YØ[‹XXÚˆËËÈ[™Û[\YÛˆ]ÈİÛ‹[™[ˆXœÛÛ]HÛ™HÛ˜\È›İ
+ÌÎ
+K‚ˆÖİ\İBˆ›ˆWÜÜÚ][Û—ÜXÚÙ]Û[İ™\×Ø›İÜ]ÚÙ[™Ê
+HÂˆ\ÙHİ\\œÜÚ][Û—ÜXÚÙ]Ü]Ú\È]ÚÂˆËÈHXÚÈ\È^Z[™ÈHXYİÛˆœ›ÛHÌÈÈHXÚÙ]\›œÈL‚ˆ\ÜÙ\Ù\HJˆ
+]Ú
+ÌŒLŒYJK]Ú
+ŒLŒYJJKˆ
+ŒLŒ
+Bˆ
+NÂˆËÈXXÚ[™Û[\ÈÛˆ]ÈİÛ‹‚ˆ\ÜÙ\Ù\HJˆ
+]Ú
+ŒŒŒYJK]Ú
+ŒŒŒŒYJJKˆ
+LŒŒ
+Bˆ
+NÂˆËÈ[ˆXœÛÛ]H]ÚYÛ›Ü™\È›İ[™Ë‚ˆ\ÜÙ\Ù\HJˆ
+]Ú
+ÌŒMKŒ˜[ÙJK]Ú
+ŒMKŒ˜[ÙJJKˆ
+MKŒMKŒ
+Bˆ
+NÂˆ\ÜÙ\Ù\HJ]Ú
+ŒLŒŒ˜[ÙJKLŒ
+NÂˆB‚ˆËËÈH\Ûİ[™ÙˆÛY[›İ[™[XYÙQ]™[XÚÙ]›ÛİÜÈ]È[XYÙBˆËËÈ\H
+^Y\‹™Ù]\Ûİ[™ˆH\IÜÈY™™XİÊKÚ]HÛÙXÉÜÂˆËËÈ\Y˜][›Üˆ[ˆ[šÛ›İÛˆ\H
+ÍMJK‚ˆÖİ\İBˆ›ˆWÚ\ÜÛİ[™Ù›ÛİÜ×İWÙ[XYÙWÙ]™[×İ\J
+HÂˆ\ÙHİ\\š\ÜÛİ[™Ù›ÜÂˆ\ÙHÜš^›Û—Ü›İØÛÛœ™YÚ\İN‘[˜[ZXÎÂˆ\ÙHÜš^›Û—İÛÜ›™[XYÙWÜÛİ\˜ÙNØ][ÙÎÂˆ]\\ÈHÂˆ
+›Z[™XÜ˜Yš[—Ùš\™H‹˜\›š[™ÈŠKˆ
+›Z[™XÜ˜Y™›İÛˆ‹™›İÛš[™ÈŠKˆ
+›Z[™XÜ˜YœİÙY]Ø™\œWØ\Ú‹œÚÚ[™ÈŠKˆ
+›Z[™XÜ˜Y™œ™Y^™H‹™œ™Y^š[™ÈŠKˆ
+›Z[™XÜ˜Y˜\œ›İÈ‹š\ŠKˆNÂˆËÈH\\ÈHÙ\™\ˆŞ[˜Ú›Ûš^™Y[ˆ™YÚ\İHÜ™\‹‚ˆ]]]™YÚ\İšY\ÈH[˜[ZXÎ™Y˜][
+
+NÂˆ™YÚ\İšY\Ë˜Y
+Üš^›Û—Ü›İØÛÛœXÚÙ]Î˜ÛÛ™šYİ\˜][Û”™YÚ\İQ]HÂˆ™YÚ\İNˆ›Z[™XÜ˜Y™[XYÙWİ\H‹š[Ê
+Kˆ[šY\Îˆ\\Âˆš]\Š
+Bˆ›X\
+ˆ
+YÊ_Üš^›Û—Ü›İØÛÛœXÚÙ]Î˜ÛÛ™šYİ\˜][Û”™YÚ\İQ[HÂˆYˆ
+
+šY
+Kš[Ê
+Kˆ]Nˆ›Û™KˆKˆ
+Bˆ˜ÛÛXİ
+
+KˆJNÂˆËÈH[XYÙHØ][ÙÎˆÛ™H[H\ˆ\HX›İ™KXXÚÚ]]ÈY™™XİË‚ˆ]š]ÈHˆŒÌŸ›Ü›X]JÎŒH‹‹×Øš]Ê
+JNÂˆ]Ø][ÙÈHØ][ÙÎ™œ›ÛWÚœÛÛŠˆ	œÙ\™WÚœÛÛšœÛÛˆJÂˆ™]Wİ™\œÚ[ÛˆˆM™œ›ÛJÜš^›Û—İÛÜ›‘UWÕ‘T”ÒSÓŠKˆ\\Èˆ\\Ëš]\Š
+K›X\
+
+YY™™XİÊ_Ù\™WÚœÛÛšœÛÛˆJÂˆšYˆYˆ›Y\ÜØYÙWÚYˆYš[WÜİ\ÛX]Ú\Ê›Z[™XÜ˜YˆŠKˆ™^]\İ[Ûˆˆš]ÊŒJKˆœØØ[[™ÈˆÚ[—ØØ]\ÙYØWÛ]š[™×Û›Û—Ü^Y\ˆ‹ˆ™Y™™XİÈˆY™™XİËˆ™X]ÛY\ÜØYÙWİ\Hˆ™Y˜][‹ˆJJK˜ÛÛXİ™XÏÏŠ
+KˆJKˆ	œÙ\™WÚœÛÛšœÛÛˆJßJKˆ
+Bˆ[Ü˜\
+
+NÂˆ›Üˆ
+Y
+˜[YKY™™XİÊJH[ˆ\\Ëš]\Š
+K™[[Y\˜]J
+HÂˆ\ÜÙ\Ù\HJˆ\ÜÛİ[™Ù›ÜŠ	œ™YÚ\İšY\Ë	˜Ø][ÙËY\ÈLÌŠKˆÜš^›Û—ØÛY[šX[š\ÜÛİ[™
+Y™™XİÊKˆÛ˜[Y_H‚ˆ
+NÂˆBˆËÈ[ˆ[šÛ›İÛˆY˜[È˜XÚÈÈHÛÙXÉÜÈY˜][Y™™XİË‚ˆ\ÜÙ\Ù\HJˆ\ÜÛİ[™Ù›ÜŠ	œ™YÚ\İšY\Ë	˜Ø][ÙË\\Ë›[Š
+H\ÈLÌŠKˆ›Z[™XÜ˜Y™[]Kœ^Y\‹š\‚ˆ
+NÂˆËÈHÙ\™\‹YYš[™Y[XYÙH\HÚ][›[™H•Y™™XİÈ™YYÈ›È[H[‚ˆËÈHÛY[	ÜÈZ[Z[ˆØ][ÙË‚ˆ]]]İ\İÛHHÜš^›Û—ØÛÜ™N›˜ÛÛ\İ[™›™]Ê
+NÂˆİ\İÛKš[œÙ\
+ˆ™Y™™XİÈ‹š[Ê
+KˆÜš^›Û—ØÛÜ™N›˜•YÎ”İš[™Ê˜\›š[™È‹š[Ê
+JKˆ
+NÂˆ™YÚ\İšY\Ë˜Y
+Üš^›Û—Ü›İØÛÛœXÚÙ]Î˜ÛÛ™šYİ\˜][Û”™YÚ\İQ]HÂˆ™YÚ\İNˆ›Z[™XÜ˜Y™[XYÙWİ\H‹š[Ê
+Kˆ[šY\Îˆ™XÈVÚÜš^›Û—Ü›İØÛÛœXÚÙ]Î˜ÛÛ™šYİ\˜][Û”™YÚ\İQ[HÂˆYˆ˜İ\İÛN›]˜WÜÜ\Ú‹š[Ê
+Kˆ]NˆÛÛYJÜš^›Û—ØÛÜ™N›˜•YÎÛÛ\İ[™
+İ\İÛJJKˆWKˆJNÂˆ\ÜÙ\Ù\HJˆ\ÜÛİ[™Ù›ÜŠ	œ™YÚ\İšY\Ë	˜Ø][ÙË
+Kˆ›Z[™XÜ˜Y™[]Kœ^Y\‹š\ÛÛ—Ùš\™H‚ˆ
+NÂˆBˆÖİ\İBˆ›ˆŞ[˜Ú›Ûš^™YÙ[XYÙWÙY˜][×Ûİ™\œšYWØWÙY™™\™[ÛØØ[ÙYš[š][ÛŠ
+HÂˆ]ØØ[HÜš^›Û—İÛÜ›™[XYÙWÜÛİ\˜ÙNØ][ÙÎ™œ›ÛWÚœÛÛŠ	œÙ\™WÚœÛÛšœÛÛˆJÂˆ™]Wİ™\œÚ[ÛˆˆÜš^›Û—İÛÜ›‘UWÕ‘T”ÒSÓ‹ˆ\\ÈˆŞÈšYˆ™[[ÎšX]‹›Y\ÜØYÙWÚYˆšX]‹™^]\İ[ÛˆˆŒ‹œØØ[[™Èˆ›™]™\ˆ‹™Y™™XİÈˆ˜\›š[™È‹™X]ÛY\ÜØYÙWİ\Hˆ™Y˜][ŸWBˆJK	œÙ\™WÚœÛÛšœÛÛˆJßJJK[Ü˜\
+
+NÂˆ]]]™YÚ\İšY\ÈHÜš^›Û—Ü›İØÛÛœ™YÚ\İN‘[˜[ZXÎ™Y˜][
+
+NÂˆ™YÚ\İšY\Ë˜Y
+Üš^›Û—Ü›İØÛÛœXÚÙ]Î˜ÛÛ™šYİ\˜][Û”™YÚ\İQ]HÂˆ™YÚ\İNˆ›Z[™XÜ˜Y™[XYÙWİ\H‹š[Ê
+Kˆ[šY\Îˆ™XÈVÚÜš^›Û—Ü›İØÛÛœXÚÙ]Î˜ÛÛ™šYİ\˜][Û”™YÚ\İQ[HÂˆYˆ™[[ÎšX]‹š[Ê
+Kˆ]NˆÛÛYJÜš^›Û—ØÛÜ™N›˜•YÎÛÛ\İ[™
+Y˜][™Y˜][
+
+JJKˆWKˆJNÂˆ\ÜÙ\Ù\HJˆİ\\š\ÜÛİ[™Ù›ÜŠ	œ™YÚ\İšY\Ë	›ØØ[
+Kˆ›Z[™XÜ˜Y™[]Kœ^Y\‹š\‚ˆ
+NÂˆBˆËËÈÛY[XÚÙ]\İ[™\‹š[™TÙ][]T\ÜÙ[™Ù\œÔXÚÙ]ˆH™ZXÛBˆËËÈZ™XİÈ]È\ÜÙ[™Ù\œË[ˆXXÚ\İY[]Hİ\šY[™ØÈ]ÛÂˆËËÈ\Õ™ZXÛXÛÈÚ[HH\İ\È›İ[\KÚ]]™\ˆH\ÜÙ[™Ù\‰ÜÂˆËËÈ\NˆHÙ\™\‰ÜÈ][H\Ü^HšY[™ÈH^Y\ˆY\È]^Y\‰ÜÈ˜[YBˆËËÈYÈZÙHH^\Ü^HÙ\È
+ÍMŠK‚ˆÖİ\İBˆ›ˆ[Wİ˜XÚÙYÜ\ÜÙ[™Ù\—ÛXZÙ\×Ú]×İ™ZXÛWØWİ™ZXÛJ
+HÂˆ\ÙHİ˜ÛÛXİ[ÛœÎÒ\ÚX\\ÚÙ]NÂˆ]˜XÚÙYHÚ[™ˆ	œİŸİ\\•˜XÚÙYÂˆÚ[™ˆÚ[™×ÛİÛ™Y
+
+KˆÜÚ][ÛˆÌŒŒŒKˆÛÙX×Ø˜\ÙNˆÌŒŒŒKˆÚ[[ˆ˜[ÙKˆ™ZXÛNˆ›Û™KˆNÂˆ]]][]Y\ÈH\ÚX\™œ›ÛJÂˆ
+‹˜XÚÙY
+›Z[™XÜ˜Yœ^Y\ˆŠJKˆ
+Ë˜XÚÙY
+›Z[™XÜ˜Yœ^Y\ˆŠJKˆ
+K˜XÚÙY
+›Z[™XÜ˜Yš][WÙ\Ü^HŠJKˆ
+L˜XÚÙY
+›Z[™XÜ˜Y˜›ØÚ×Ù\Ü^HŠJKˆJNÂˆ]™ZXÛ\ÈHNˆ	’\ÚX\LÌ‹İ\\•˜XÚÙYŸOˆ\ÚÙ]LÌˆÂˆK˜[Y\Ê
+K™š[\—ÛX\
+™ZXÛJK˜ÛÛXİ
+
+BˆNÂˆİ\\œÙX]Ü\ÜÙ[™Ù\œÊ	›]][]Y\Ë‹	–ÎKLJNÂˆ\ÜÙ\Ù\HJ™ZXÛ\Ê	™[]Y\ÊK\ÚÙ]™œ›ÛJÍ—JJNÂˆËÈH\İ™\XÙ\ÈHÛÛ™NˆLÛİÙ™‹Hİ[šY\Ë‚ˆİ\\œÙX]Ü\ÜÙ[™Ù\œÊ	›]][]Y\Ë‹	–ÎWJNÂˆ\ÜÙ\Ù\HJ[]Y\ÖÉŒLK™ZXÛK›Û™JNÂˆ\ÜÙ\Ù\HJ[]Y\ÖÉWK™ZXÛKÛÛYJŠJNÂˆËÈİ\šY[™ÈX]™\ÈHÛ™ZXÛHš\œİ‚ˆİ\\œÙX]Ü\ÜÙ[™Ù\œÊ	›]][]Y\ËË	–ÎWJNÂˆ\ÜÙ\Ù\HJ™ZXÛ\Ê	™[]Y\ÊK\ÚÙ]™œ›ÛJÍ×JJNÂˆËÈ[ˆ[\H\İˆ›Ø›ÙHšY\ÈÈ[H[Ü™K‚ˆİ\\œÙX]Ü\ÜÙ[™Ù\œÊ	›]][]Y\ËË	–×JNÂˆ\ÜÙ\J™ZXÛ\Ê	™[]Y\ÊKš\×Ù[\J
+JNÂˆBˆËËÈÛY[›İ[™Ûİ[™[]TXÚÙ]ˆHÛİ[™\ÈX\™Ú\™HH[]H]ˆËËÈ˜[Y\È\È8 %HØØ[^Y\ˆ[˜ÛYYÚXÚ\È›È˜XÚÙY[]H8 %[™ˆËËÈ[ˆY\È]™[Ù\Û‰İ]™H^\È›İ[™È][‚ˆÖİ\İBˆ›ˆWÜÛİ[™Ù[]WÚ\×ÚX\™İÚ\™WÚ]×Ù[]WÚ\Ê
+HÂˆ\ÙHİ˜ÛÛXİ[ÛœÎ’\ÚX\Âˆ]]]˜XÚÙYH\ÚX\›™]Ê
+NÂˆ˜XÚÙYš[œÙ\
+ˆËˆİ\\•˜XÚÙYÂˆÚ[™ˆ›Z[™XÜ˜Y˜ÛİÈ‹×ÛİÛ™Y
+
+KˆÜÚ][ÛˆÎKŒLËWKˆÛÙX×Ø˜\ÙNˆÎKŒLËWKˆÚ[[ˆ˜[ÙKˆ™ZXÛNˆ›Û™KˆKˆ
+NÂˆ]^Y\ˆHÛÛYJ
+‹ÌKÌŒWK˜[ÙJJNÂˆ\ÜÙ\Ù\HJˆİ\\™[]WÜÛİ[™Üİ]J‹^Y\‹›Û™K	˜XÚÙY›Û™JBˆ™š[\Šß\ËœÚ[[
+Bˆ›X\
+ßËœÜÚ][ÛŠKˆÛÛYJÌKÌŒWJKˆHØØ[^Y\ˆ\È˜[YYH™[[İK™[]WÚY‚ˆ
+NÂˆ\ÜÙ\Ù\HJˆİ\\™[]WÜÛİ[™Üİ]JË^Y\‹›Û™K	˜XÚÙY›Û™JBˆ™š[\Šß\ËœÚ[[
+Bˆ›X\
+ßËœÜÚ][ÛŠKˆÛÛYJÎKŒLËWJKˆ˜[›İ\ˆ[]HHÙ\™\ˆÜ]Û™Y‚ˆ
+NÂˆ\ÜÙ\Ù\HJˆİ\\™[]WÜÛİ[™Üİ]JK^Y\‹›Û™K	˜XÚÙY›Û™JBˆ™š[\Šß\ËœÚ[[
+Bˆ›X\
+ßËœÜÚ][ÛŠKˆ›Û™Kˆ™Ù][]H\È[ˆ[™TÛİ[™[]Q]™[™]\›œÈ‚ˆ
+NÂˆ\ÜÙ\Ù\HJˆİ\\™[]WÜÛİ[™Üİ]J‹›Û™K›Û™K	˜XÚÙY›Û™JBˆ™š[\Šß\ËœÚ[[
+Bˆ›X\
+ßËœÜÚ][ÛŠKˆ›Û™Kˆ˜H^Y\ˆÚ]›ÈÜÚ][ÛˆY]‚ˆ
+NÂˆBˆÖİ\İBˆ›ˆWÜÛİ[™Ù[]WÜ™]Z[œ×ÜÚ[[˜ÙWÙ›Ü—Ü^Y\œ×Ø[™Û›Û—Û[Ø—İ\™Ù]Ê
+HÂˆ\ÙHİ˜ÛÛXİ[ÛœÎ’\ÚX\Âˆ]]]˜XÚÙYH\ÚX\›™]Ê
+NÂˆ˜XÚÙYš[œÙ\
+ˆËˆİ\\•˜XÚÙYÂˆÚ[™ˆ›Z[™XÜ˜Y˜\œ›İÈ‹×ÛİÛ™Y
+
+KˆÜÚ][ÛˆÎKŒLËWKˆÛÙX×Ø˜\ÙNˆÎKŒLËWKˆÚ[[ˆYKˆ™ZXÛNˆ›Û™KˆKˆ
+NÂˆ]İ]HHİ\\™[]WÜÛİ[™Üİ]JË›Û™K›Û™K	˜XÚÙY›Û™JK[Ü˜\
+
+NÂˆ\ÜÙ\Jİ]KœÚ[[
+NÂˆ\ÜÙ\J\İ]Kœ™[[İ™Y
+NÂˆ\ÜÙ\Ù\HJİ]KœÜÚ][Û‹ÎKŒLËWJNÂˆ]^Y\ˆBˆİ\\™[]WÜÛİ[™Üİ]J‹ÛÛYJ
+‹ÌKŒ‹ŒËŒKYJJK›Û™K	˜XÚÙY›Û™JBˆ[Ü˜\
+
+NÂˆ\ÜÙ\J^Y\‹œÚ[[
+NÂˆ\ÜÙ\Jİ\\™[]WÜÛİ[™Üİ]JK›Û™K›Û™K	˜XÚÙY›Û™JKš\×Û›Û™J
+JNÂˆBˆÖİ\İBˆ›ˆWÙ˜YÛÛ—ÜÛİ[™İ\Ù\×Û]™WÛ[İ™[Y[İÚ]İ]ÛÜÚ[™×Û[Ø—ÛY]Y]J
+HÂˆ\ÙHÜš^›Û—ØÛY[œÛİ[™Ù[™Ú[™N”Ûİ[™[]Tİ]NÂˆ]İ[HHÛİ[™[]Tİ]HÂˆÜÚ][ÛˆÌŒŒŒKˆÚ[[ˆYKˆ™[[İ™Yˆ˜[ÙKˆNÂˆ]˜XÚÙYHİ˜ÛÛXİ[ÛœÎ’\ÚX\›™]Ê
+NÂˆ›ÜˆÜÚ][Ûˆ[ˆÖÌŒŒLM‹ŒKÌKKKŒLNŒWHÂˆ]İ]HBˆİ\\™[]WÜÛİ[™Üİ]JË›Û™KÛÛYJİ[JK	˜XÚÙYÛÛYJ
+ËÜÚ][ÛŠJJBˆ[Ü˜\
+
+NÂˆ\ÜÙ\Ù\HJİ]KœÜÚ][Û‹ÜÚ][ÛŠNÂˆ\ÜÙ\Jİ]KœÚ[[
+NÂˆ\ÜÙ\J\İ]Kœ™[[İ™Y
+NÂˆBˆ][œ™[]YBˆİ\\™[]WÜÛİ[™Üİ]JË›Û™KÛÛYJİ[JK	˜XÚÙYÛÛYJ
+ÎNKŒÈ×JJJBˆ[Ü˜\
+
+NÂˆ\ÜÙ\Ù\HJ[œ™[]YœÜÚ][Û‹İ[KœÜÚ][ÛŠNÂˆ\ÜÙ\Jİ\\™[]WÜÛİ[™Üİ]JË›Û™K›Û™K	˜XÚÙYÛÛYJ
+ËÎNKŒÈ×JJJKš\×Û›Û™J
+JNÂˆB‚ˆËËÈHİ™\ˆHÛİÙˆH[™[ÜHÛˆHÙ\™\ˆ
+ÌÌÍMÊNˆH™YXİY“ÕÂˆËËÈ›ÜÈHİXÚËÛÈH^Y\‰ÜÈ[™İÚ[™ÜË\È]š[™Ñ[]K™›ÜˆËËÈÙ\È›Üˆ™YXİ[Û‹”‘QPÕQÈHZ[ˆXÚÈ\›ÜÈ›İ[™Ë‚ˆÖİ\İBˆ›ˆWÜ™YXİYİ›İ×Ùœ›ÛWØWÜÛİÜİÚ[™Ü×İWÚ[™
+
+HÂˆ\ÙHÜš^›Û—ØÛY[Âˆ˜[›™\˜[›™\œËˆœ™]Ú[™Îœ™]Ú[™ËˆÜ˜Y[™Î”™XÚ\\ËˆÜ™X]]™N“˜[Y\Ëˆ[˜Ú[‘[˜Ú[Y[Ëˆ][\ÎÒ][TİXÚË][\ßKˆY[NÑ[‹[œ]Ú[™Y[_Kˆİ][ÛœÎ”İ][Û”™XÚ\\ËˆNÂˆ]›ÛİHİœ]”]›™]Ê[ˆJĞT‘Ó×ÓPS’Q‘TÕÑTˆŠJBˆš›Ú[Š‹‹‹Ë‹‹Ë›ØØ[ÚÜš^›Û‹XÛY[ŠBˆš›Ú[ŠÜš^›Û—ØÛÜ™N•S’SWÕ‘T”ÒSÓŠNÂˆYˆ\›Ûİš›Ú[Šš][\ËšœÛÛˆŠK™^\İÊ
+HÂˆ™]\›ÂˆBˆ]›Û™HH	šÜš^›Û—İÛÜ››Ûİ”XÚÓİ™\›^N““Ó‘NÂˆ]Y˜][ÈHÜš^›Û—İÛÜ›š][WÙY˜][Îœ™XY
+	œ›Ûİ
+K[Ü˜\
+
+NÂˆ]][\ÈH][\Î˜Ø][ÙÊ	œ›Ûİ›Û™K	™Y˜][ÊK[Ü˜\
+
+NÂˆ]™XÚ\\ÈH™XÚ\\Î›ØY
+	œ›Ûİ	š][\Ë›Û™K	˜Ü˜]N™Ø[YN\İÜÙ\™\—ÛØY
+
+JK[Ü˜\
+
+NÂˆ]œ™]Ú[™ÈHœ™]Ú[™Î›ØY
+	œ›Ûİ	š][\Ë›Û™JNÂˆ]˜[›™\œÈH˜[›™\œÎ›ØY
+	œ›Ûİ	™Y˜][ÊNÂˆ]İ][Û—Ü™XÚ\\ÈBˆİ][Û”™XÚ\\Î›ØY
+	œ›Ûİ	š][\Ë›Û™K	˜Ü˜]N™Ø[YN\İÜÙ\™\—ÛØY
+
+JNÂˆ][˜Ú[Y[ÈH[˜Ú[Y[Î™Y˜][
+
+NÂˆ]˜[Y\ÈH˜[Y\Î™Y˜][
+
+NÂˆ][ˆH[ˆÂˆÜ˜Y[™×Ü™[XZ[™\ˆ›Û™Kˆ^Y\ˆ›Û™Kˆ^Y\—Ù[]WÚYˆ›Û™KˆÛÜØÛÛ^ˆ	˜Ü˜]N™Ø[YN\İÜÙ\™\—ÛØY
+
+Bˆ›ÛÜØÛÛ^
+Üš^›Û—İÛÜ››˜]]™WÛØYØÛÛ^“ÛÜÚYNÛY[×JKˆ][\Îˆ	š][\Ëˆ™XÚ\\Îˆ	œ™XÚ\\Ëˆœ™]Ú[™Îˆ	˜œ™]Ú[™Ëˆ˜[›™\œÎˆ	˜˜[›™\œËˆİ][Û—Ü™XÚ\\Îˆ	œİ][Û—Ü™XÚ\\Ëˆ[˜Ú[Y[Îˆ	™[˜Ú[Y[Ëˆ˜[Y\Îˆ	›˜[Y\Ëˆ˜YNˆ›Û™KˆX\Îˆ›Û™Kˆ[Z]YØÜ˜Y[™Îˆ˜[ÙKˆÛ›İÛ—Ü™XÚ\\Îˆ›Û™KˆNÂˆ]]]Y[HHY[N›™]ÊÚ[™’[™[ÜJNÂˆ]ÛØ˜›\İÛ™HH][TİXÚÈÂˆ][Nˆ›Z[™XÜ˜Y˜ÛØ˜›\İÛ™H‹š[Ê
+KˆÛİ[ˆM‹ˆ[XYÙNˆˆ^˜Nˆ›Û™KˆNÂˆËÈHš\œİİ˜\ˆÛİÙˆ[™[ÜSY[K‚ˆY[KœÙ]ÜÛİ
+	™[‹Í‹ÛÛYJÛØ˜›\İÛ™JJNÂˆ]
+Ù[™]ÊHBˆİ\\œ™YXİØÛXÚÜÊ	›]]Y[K	™[‹	–ÊÍ‹[œ]•›İÊWJK[Ü˜\
+
+NÂˆ\ÜÙ\J™]Ë”Hİ™\ˆHÛİ›ÜÈÛ™H[™İÚ[™ÜÈŠNÂˆ\ÜÙ\Ù\HJY[KœÛİ
+ÍŠK›X\
+ßË˜Ûİ[
+KÛÛYJMJJNÂˆ\ÜÙ\Ù\HJÙ[›[Š
+KJNÂˆ]
+Ë™]ÊHHİ\\œ™YXİØÛXÚÜÊ	›]]Y[K	™[‹	–ÊÍ‹[œ]”XÚİ\
+WJK[Ü˜\
+
+NÂˆ\ÜÙ\J]™]ËœXÚÚ[™ÈHİXÚÈ\›ÜÈ›İ[™ÈŠNÂˆ]
+Ë™]ÊHBˆİ\\œ™YXİØÛXÚÜÊ	›]]Y[K	™[‹	–ÊNNNKK[œ]”XÚİ\
+WJK[Ü˜\
+
+NÂˆ\ÜÙ\J™]Ë›Û™HÙˆHØ\œšYYİXÚÈİ]ÚYHHÚ[™İÈŠNÂˆB‚ˆÖİ\İBˆ›ˆœ™YWÙ\™Xİ[Û—ÜÙ[™×ØWØœ™XZ×Ø™Y›Ü™WİWÛ[İ™Wİ]ÙÛÙ\×Ú[×Ú]×ÜÜXÙJ
+HÂˆ\ÙHİ\\Ñ[\KË^KØZ]×Ù›Ü—İWİšY]ßNÂˆ]Xİ[ÛˆHXİ[ÛŸÂˆÎ”^Y\Xİ[ÛŠ^N”^Y\Xİ[ÛˆÂˆXİ[Û‹ˆÜÎˆÌŒ‹Kˆ\™Xİ[ÛˆˆÙ\]Y[˜ÙNˆKˆJBˆNÂˆËÈİ\Ú[™ÙH\™Xİ[Û‹X›Ü[™İÜÛÈ]Û˜ÙHšYÚY\ˆHİY\™Y[İ™K‚ˆ›ÜˆYÈ[ˆ‹LÈÂˆ\ÜÙ\Jˆ]ØZ]×Ù›Ü—İWİšY]Ê	˜Xİ[ÛŠYÊKYK˜[ÙJKˆ˜Xİ[ÛˆÙYßH‚ˆ
+NÂˆBˆËÈH›Ü
+K“ÔÒUSJH[™H\ÙHØZ]›ÜˆH[İ™HÚ]HšY]ÉÜÈÛÚË‚ˆ]\ÙYHÎ•\ÙR][J^N•\ÙR][HÂˆ[™ˆˆÙ\]Y[˜ÙNˆ‹ˆX]ÎˆŒˆ]ÚˆŒˆJNÂˆ\ÜÙ\JØZ]×Ù›Ü—İWİšY]Ê	˜Xİ[ÛŠJKYK˜[ÙJJNÂˆ\ÜÙ\JØZ]×Ù›Ü—İWİšY]Ê	\ÙYYK˜[ÙJJNÂˆ\ÜÙ\J]ØZ]×Ù›Ü—İWİšY]Ê	\ÙY˜[ÙK˜[ÙJJNÂˆËÈY\ˆÛÛY][™È[]™\][™ÈØZ]Ë[ˆÜ™\ÈHİÚ[™È[Û™H™]™\ˆÙ\Ë‚ˆ\ÜÙ\JØZ]×Ù›Ü—İWİšY]Ê	˜Xİ[ÛŠ
+KYKYJJNÂˆ\ÜÙ\JØZ]×Ù›Ü—İWİšY]Ê	”Î”[˜Ú
+[\JK˜[ÙKYJJNÂˆ\ÜÙ\J]ØZ]×Ù›Ü—İWİšY]Ê	”Î”[˜Ú
+[\JKYK˜[ÙJJNÂˆB‚ˆÖİ\İBˆ›ˆXÙ[Y[Ü™]šY]×ØÚXÚÜ×ÛØœİXİ[Û—İÚ]İ]ØÚ[™Ú[™×İWÛ]™[
+
+HÂˆ\ÙHİ\\‘S]™[Âˆ\ÙHÜš^›Û—ØÛÜ™NÜÜÚ][Û›ØÚÔÜË˜[™ÛN“YØXŞT˜[™Û_NÂˆ\ÙHÜš^›Û—İÛÜ›Âˆ]™[Âˆ™Z]š[İ\œË]™[XØÙ\ÜËXÙPÛÛ^XÙSİ]ÛÛYKXÚÜË]N›ØYÜ™YÚ\İKˆKˆ™YÚ\İN›ØÚÔİ]RYˆNÂ‚ˆİXİ]™[ÂˆZ\ˆ›ØÚÔİ]RYˆİÛ™Nˆ›ØÚÔİ]RYˆİÙ\ˆ›ØÚÔİ]RYˆÛY[ÜÚYNˆ›ÛÛˆØœİXİYˆ›ÛÛˆØYYˆ›ÛÛˆÙZ[[™ÎˆLÌ‹ˆBˆ[\Üš^›Û—İÛÜ››]™[›ØÚÑ[]S™ZYÚ›ÜœÈ›Üˆ]™[ßBˆ[\]™[XØÙ\ÜÈ›Üˆ]™[Âˆ›ˆ›ØÚ×Üİ]J	œÙ[‹ÜÎˆ›ØÚÔÜÊHOˆ›ØÚÔİ]RYÂˆYˆÜÈOH›ØÚÔÜÎ›™]Ê
+HÂˆÙ[‹œİÛ™BˆH[ÙHYˆÜÈOH›ØÚÔÜÎ›™]ÊLKK
+HÂˆÙ[‹œİÙ\‚ˆH[ÙHÂˆÙ[‹˜Z\‚ˆBˆBˆ›ˆÙ]Ü˜]Ê	›]]Ù[‹Îˆ›ØÚÔÜËÎˆ›ØÚÔİ]RY
+HOˆÜ[Û›ØÚÔİ]RYˆÂˆ[šXÈJœ™]šY]È]\İ›İÜš]HÈH]™H]™[ŠNÂˆBˆ›ˆ\×ÛØYY
+	œÙ[‹Îˆ›ØÚÔÜÊHOˆ›ÛÛÂˆÙ[‹›ØYYˆBˆ›ˆ\×ØÛY[ÜÚYJ	œÙ[ŠHOˆ›ÛÛÂˆÙ[‹˜ÛY[ÜÚYBˆBˆ›ˆX^ŞJ	œÙ[ŠHOˆLÌˆÂˆÙ[‹˜ÙZ[[™ÂˆBˆ›ˆ\×İ[›ØœİXİY
+	œÙ[‹ÜÎˆ›ØÚÔÜËÎˆ›ØÚÔİ]RY
+HOˆ›ÛÛÂˆ\ÜÙ\Ù\HJÜË›ØÚÔÜÎ›™]ÊK
+JNÂˆ\Ù[‹›ØœİXİYˆBˆ›ˆ˜[™ÛJ	›]]Ù[ŠHOˆ	›]]YØXŞT˜[™ÛHÂˆ[šXÈJœ™]šY]È]\İ›İY˜[˜ÙHH]™H]™[	ÜÈ˜[™ÛHÛİ\˜ÙHŠNÂˆBˆ›ˆØ[YWİ[YJ	œÙ[ŠHOˆMÂˆˆBˆB‚ˆËÈ\ÈÚ]HSˆ\İË™\\™YØ[YH™\Ûİ\˜Ù\È\™HÜ[Û˜[ØØ[K‚ˆ]™\Ûİ\˜Ù\ÈHİœ]”]›™]Ê[ˆJĞT‘Ó×ÓPS’Q‘TÕÑTˆŠJBˆš›Ú[Š‹‹‹Ë‹‹Ë›ØØ[ÚÜš^›Û‹XÛY[ŠBˆš›Ú[ŠÜš^›Û—ØÛÜ™N•S’SWÕ‘T”ÒSÓŠNÂˆYˆ\™\Ûİ\˜Ù\Ëš›Ú[Š˜›ØÚËX™Z]š[İ\œËšœÛÛˆŠK™^\İÊ
+HÂˆ™]\›ÂˆBˆ]™YÚ\İHHØYÜ™YÚ\İJ	œ™\Ûİ\˜Ù\ÊK[Ü˜\
+
+NÂˆ]™Z]š[İ\œÈH™Z]š[İ\œÎ›ØY
+	œ™YÚ\İK	œ™\Ûİ\˜Ù\ÊK[Ü˜\
+
+NÂˆ]]]˜\ÙHH]™[ÂˆZ\ˆ™YÚ\İK™Y˜][Üİ]J›Z[™XÜ˜Y˜Z\ˆŠK[Ü˜\
+
+KˆİÛ™Nˆ™YÚ\İK™Y˜][Üİ]J›Z[™XÜ˜YœİÛ™HŠK[Ü˜\
+
+KˆİÙ\ˆ™YÚ\İK™Y˜][Üİ]J›Z[™XÜ˜Yœ™YİÛ™WØ›ØÚÈŠK[Ü˜\
+
+KˆÛY[ÜÚYNˆYKˆØœİXİYˆ˜[ÙKˆØYYˆYKˆÙZ[[™ÎˆÌŒˆNÂˆ›Üˆ][H[ˆÂˆ›Z[™XÜ˜YœİÛ™H‹ˆ›Z[™XÜ˜Y›ØZ×ÜÛXˆ‹ˆ›Z[™XÜ˜Y›ØZ×ÙÛÜˆ‹ˆ›Z[™XÜ˜Y‹ˆ›Z[™XÜ˜Yœ\İÛˆ‹ˆ›Z[™XÜ˜YœİXÚŞWÜ\İÛˆ‹ˆËÈÜ›İÚ[™Ô[XY›ØÚË™Ù]İ]Q›Ü”XÙ[Y[˜]ÜÈH˜[™ÛHYÙK‚ˆ›Z[™XÜ˜YÚ\İ[™×İš[™\È‹ˆHÂˆ]İHXÙPÛÛ^ÂˆÛXÚÙYÜÜÎˆ›ØÚÔÜÎ›™]Ê
+Kˆ˜XÙNˆÜš^›Û—ØÛÜ™N™Ù[ÛY]N‘\™Xİ[Û•\ˆ]ˆÜš^›Û—ØÛÜ™N™Ù[ÛY]N•™XÌÎ›™]ÊKKŒJKˆ[œÚYNˆ˜[ÙKˆX]ÎˆŒˆ]ÚˆKŒˆÛ™XZÚ[™Îˆ˜[ÙKˆ][Nˆ][Kš[Ê
+KˆØ[—İ\ÙWÙØ[YWÛX\İ\—Ø›ØÚÜÎˆ˜[ÙKˆNÂˆ›Üˆ
+ÛY[ÜÚYKØœİXİYØYYÙZ[[™ÊH[ˆÂˆ
+YK˜[ÙKYKÌŒ
+Kˆ
+YKYKYKÌŒ
+Kˆ
+YK˜[ÙK˜[ÙKÌŒ
+Kˆ
+YK˜[ÙKYKJKˆ
+˜[ÙK˜[ÙKYKÌŒ
+KˆHÂˆ˜\ÙK˜ÛY[ÜÚYHHÛY[ÜÚYNÂˆ˜\ÙK›ØœİXİYHØœİXİYÂˆ˜\ÙK›ØYYHØYYÂˆ˜\ÙK˜ÙZ[[™ÈHÙZ[[™ÎÂˆ]˜[YH[ØœİXİY	‰ˆØYY	‰ˆÙZ[[™ÈˆNÂˆ]]]™]šY]ÈHS]™[›™]Ê	˜˜\ÙJNÂˆ]]]XÚÜÈHXÚÜÎ™Y˜][
+
+NÂˆ]İ]ÛÛYHH™Z]š[İ\œËœXÙWØ›ØÚÊ	›]]™]šY]Ë	›]]XÚÜË	˜İ
+NÂˆ\ÜÙ\Ù\HJˆX]Ú\ÈJİ]ÛÛYKXÙSİ]ÛÛYN”XÙYÈ‹ˆJKˆ˜[YˆÚ][_KØœİXİY^ÛØœİXİYKØYY^ÛØYYKÙZ[[™Ï^ØÙZ[[™ßH‚ˆ
+NÂˆ\ÜÙ\Ù\HJ™]šY]Ë˜Ú[™ÙYš\×Ù[\J
+K]˜[Y
+NÂˆYˆ˜[Yˆ	‰ˆX]Ú\ÈJˆ][Kˆ›Z[™XÜ˜Yˆ›Z[™XÜ˜Yœ\İÛˆˆ›Z[™XÜ˜YœİXÚŞWÜ\İÛˆ‚ˆ
+BˆÂˆ\ÜÙ\Ù\HJˆ™YÚ\İBˆœİ]J™]šY]Ë˜›ØÚ×Üİ]J›ØÚÔÜÎ›™]ÊK
+JJBˆ[Ü˜\
+
+Bˆ›˜[YKˆYˆ][HOH›Z[™XÜ˜Yˆ	‰ˆXÛY[ÜÚYHÂˆ›Z[™XÜ˜Y˜Z\ˆ‚ˆH[ÙHÂˆ][BˆKˆœİÙ\™YÚ][_KÛY[ÜÚYO^ØÛY[ÜÚY_H‚ˆ
+NÂˆ\ÜÙ\Ù\HJˆXÚÜË˜›ØÚ×Ù]™[Ëš\×Ù[\J
+KˆÛY[ÜÚYH][HOH›Z[™XÜ˜Y‹ˆ›Û›HHÙ\™\ˆİ\ÈHİÙ\™Y\İÛˆ‚ˆ
+NÂˆBˆ\ÜÙ\Ù\HJ˜\ÙK˜›ØÚ×Üİ]J›ØÚÔÜÎ›™]ÊK
+JK˜\ÙK˜Z\ŠNÂˆBˆBˆB‚ˆÖİ\İBˆ›ˆWØÜ™X]]™WÜŞ[˜×ØÛİ™\œ×Ú[™[ÜWÛY[WÜÛİ×ÍWİ×ÍWÛÛ˜ÙWÙXXÚ
+
+HÂˆËÈÜ™X]]™R[™[ÜS\İ[™\ˆÙ[™È]™\H[™[ÜSY[HÛİ]HÜ˜Y[™ÈÛ™\ÎˆBˆËÈ\›[İ\ˆ
+K‹N
+KH[™[ÜH
+K‹M
+H[™HÙ™ˆ[™
+JK‚ˆ]İXÚÈH][Nˆ	œİŸÛÛYJÜš^›Û—ØÛY[š][\Î’][TİXÚÎ›™]Ê][KJJNÂˆ][™[ÜNˆ™XÏÏˆH
+‹ŒÍŠBˆ›X\
+_İXÚÊ	™›Ü›X]J›Z[™XÜ˜Yš][WŞÚ_HŠJJBˆ˜ÛÛXİ
+
+NÂˆ]Ù™š[™HİXÚÊ›Z[™XÜ˜YœÚY[ŠNÂˆ]\›[ÜˆHÂˆİXÚÊ›Z[™XÜ˜Y™X[[Û™Ú[Y]ŠKˆİXÚÊ›Z[™XÜ˜Y™X[[Û™ØÚ\İ]HŠKˆİXÚÊ›Z[™XÜ˜Y™X[[Û™ÛYÙÚ[™ÜÈŠKˆİXÚÊ›Z[™XÜ˜Y™X[[Û™Ø›ÛİÈŠKˆNÂˆ]İXÚÜÈHİ\\˜Ü™X]]™WÜŞ[˜×ÜİXÚÜÊ	š[™[ÜK	›Ù™š[™	˜\›[ÜŠNÂˆ\ÜÙ\Ù\HJİXÚÜË›[Š
+Kİ\\Ô‘PUU‘WÔÖSÑQ
+NÂˆ]]]ÛİÎˆ™XÏLMˆH
+‹œİXÚÜË›[Š
+JK›X\
+İ\\˜Ü™X]]™WÜŞ[˜×ÜÛİ
+K˜ÛÛXİ
+
+NÂˆËÈXXÚ[HÛÙ\ÈÈHY[HÛİ]ÛÈ]İXÚË‚ˆ›Üˆ
+K	œÛİ
+H[ˆÛİËš]\Š
+K™[[Y\˜]J
+HÂˆ]Ø[YWÜÛİHØ[YNš[™[ÜWÜØÜ™Y[—ÜÛİ
+š[™[ÜH‹LÌ™œ›ÛJÛİ
+JK[Ü˜\
+
+NÂˆ]^XİYHX]ÚØ[YWÜÛİÂˆ‹ŒÍˆOˆ	š[™[ÜVÙØ[YWÜÛİKˆLOˆ	›Ù™š[™ˆL‹LOˆ	˜\›[Ü–ÙØ[YWÜÛİHLKˆÈOˆ[šXÈJ™[HÚ_HÙ[ÈØ[YHÛİÙØ[YWÜÛİHŠKˆNÂˆ\ÜÙ\Ù\HJ	œİXÚÜÖÚWK^XİY™[HÚ_KY[HÛİÜÛİHŠNÂˆBˆÛİËœÛÜ
+
+NÂˆ\ÜÙ\Ù\HJÛİË
+K‹MJK˜ÛÛXİ™XÏLMŠ
+JNÂˆB‚ˆÖİ\İBˆ›ˆWÜÙ\™\—ÜÛİİ\]WÛX]™\×Ø[—İ[œÙ[ØÜ™X]]™WØÛXÚ×İ×Ø™WÜÙ[
+
+HÂˆ]İXÚÈH][Nˆ	œİŸÛÛYJÜš^›Û—ØÛY[š][\Î’][TİXÚÎ›™]Ê][KJJNÂˆ]›Û™HH™XÈVÓ›Û™NÈİ\\Ô‘PUU‘WÔÖSÑQNÂˆËÈŞ[˜ÙYˆ›İ[™ËˆHÛXÚÈ]ÈH[Y]Ûˆ
+[HÍË›İÙ[Y]
+K[ˆHÙ\™\‚ˆËÈÙ]Èİ˜\ˆÛİ
+HXÚİ\
+NˆÛ›H][HÛİ[È\ÈŞ[˜ÙY‚ˆ]]]Ş[˜ÙYH›Û™J
+NÂˆ]]]™Y›Ü™HH›Û™J
+NÂˆ™Y›Ü™VÌÍ×HHİXÚÊ›Z[™XÜ˜Y™X[[Û™Ú[Y]ŠNÂˆ]]]›İÈH™Y›Ü™K˜ÛÛ™J
+NÂˆ›İÖÌHHİXÚÊ›Z[™XÜ˜YœİXÚÈŠNÂˆİ\\›X\š×ÜŞ[˜ÙY
+	›]]Ş[˜ÙY	˜™Y›Ü™K›İË˜ÛÛ™J
+JNÂˆ\ÜÙ\Ù\HJŞ[˜ÙYÌK›İÖÌJNÂˆ\ÜÙ\Ù\HJˆŞ[˜ÙYÌÍ×K›Û™KˆH[Y]İ[Y™™\œËÛÈH™^XÚÈÙ[™È]‚ˆ
+NÂˆB‚ˆÖİ\İBˆ›ˆ]™\WÚ[™[ÜWÛY[WÜÛİÚ\×ØWÙØ[YWÜÛİØ[™ÍWÚ\×İWÛÙ™—Ú[™
+
+HÂˆËÈ[™[ÜSY[Nˆ™\İ[ˆÜšY\›[İ\‹È
+ÈH[™[ÜHÛİË[ˆHÙ™ˆ[™‚ˆ\ÜÙ\Ù\HJØ[YNš[™[ÜWÜØÜ™Y[—ÜÛİ
+š[™[ÜH‹JKÛÛYJL
+JNÂˆ]]]ÙY[ˆHİ˜ÛÛXİ[ÛœÎ’\ÚÙ]›™]Ê
+NÂˆ›ÜˆÛİ[ˆ‹ˆÂˆ][\›˜[HØ[YNš[™[ÜWÜØÜ™Y[—ÜÛİ
+š[™[ÜH‹Ûİ
+NÂˆ\ÜÙ\J[\›˜[š\×ÜÛÛYWØ[™
+_ÙY[‹š[œÙ\
+JJKœÛİÜÛİHŠNÂˆBˆ\ÜÙ\Ù\HJØ[YNš[™[ÜWÜØÜ™Y[—ÜÛİ
+š[™[ÜH‹ŠK›Û™JNÂˆB‚ˆÖİ\İBˆ›ˆ™[[İWØÛXÚÜ×Ùš[™ÜÛİ×Ü\İİWÛÛÛ\™ÙWØÚ\İØİ]Ù™Š
+HÂˆ›Üˆ
+Y[K[\›˜[[™^
+H[ˆÂˆ
+›Z[™XÜ˜Y™Ù[™\šX×Î^ˆ‹NŒÊKˆ
+›Z[™XÜ˜Y™Ù[™\šX×Î^ˆ‹NK
+Kˆ
+›Z[™XÜ˜Y™Ù[™\šX×Î^ˆ‹JKˆ
+›Z[™XÜ˜Y™Ù[™\šX×Î^ˆ‹JKˆ
+›Z[™XÜ˜Y™Ù[™\šX×Î^ˆ‹ÍLËLÊKˆ
+›Z[™XÜ˜Y™Ù[™\šX×Î^H‹
+Kˆ
+›Z[™XÜ˜Y™Ù[™\šX×Î^‹ÌJKˆ
+›Z[™XÜ˜Y™Ù[™\šX×Î^È‹ŒŠKˆ
+š[™[ÜH‹LJKˆHÂˆ\ÜÙ\Ù\HJˆØ[YN›Y[WÜÛİÚ[™^
+Y[K[\›˜[
+KˆÛÛYJ[™^
+KˆÛY[_KØ[YHÛİÚ[\›˜[H‚ˆ
+NÂˆBˆ\ÜÙ\Ù\HJØ[YN›Y[WÜÛİÚ[™^
+›Z[™XÜ˜Y™Ù[™\šX×Î^ˆ‹ÍM
+K›Û™JNÂˆ\ÜÙ\Ù\HJØ[YN›Y[WÜÛİÚ[™^
+›Z[™XÜ˜Y™Ù[™\šX×Î^ˆ‹L
+K›Û™JNÂˆ\ÜÙ\Ù\HJØ[YN›Y[WÜÛİÚ[™^
+[šÛ›İÛˆ‹
+K›Û™JNÂˆB‚ˆËËÈš\™]ÛÜšÔ›ØÚÙ]][K\ÙX\ÈÕPĞÑTÔÈÚ[HÛY[™ÎˆHXZ[ˆ[™	ÜÂˆËËÈ›ØÚÙ][™ÈHÛXÚÈ[™HÙ™ˆ[™	ÜÈÚY[\È›İ˜Z\ÙY
+ÌÍ
+K‚ˆËËÈÛˆ›Ûİ]\ÜÙ\ËÛÈHÙ™ˆ[™İ[Ù]È]È\›‹‚ˆÖİ\İBˆ›ˆWÜ›ØÚÙ]İ\ÙYİÚ[WÙÛY[™×Ù[™×İWØÛXÚÊ
+HÂˆ]›ÛİHİœ]”]Y™œ›ÛJ[ˆJĞT‘Ó×ÓPS’Q‘TÕÑTˆŠJBˆš›Ú[Š‹‹‹Ë‹‹Ë›ØØ[ÚÜš^›Û‹XÛY[ŠBˆš›Ú[ŠÜš^›Û—ØÛÜ™N•S’SWÕ‘T”ÒSÓŠNÂˆYˆ\›Ûİš›Ú[Šš][\ËšœÛÛˆŠK™^\İÊ
+HÂˆ\š[ˆJœÚÚ\[™Îˆ›È™\\™Y™\Ûİ\˜Ù\È[ˆßH‹›Ûİ™\Ü^J
+JNÂˆ™]\›ÂˆBˆ]™YÚ\İHHÜš^›Û—İÛÜ››]™[™]N›ØYÜ™YÚ\İJ	œ›Ûİ
+K[Ü˜\
+
+NÂˆ]˜XİÈHÜš^›Û—ØÛY[˜›ØÚÜÎ›ØÚÑ˜XİÎ›ØY
+	œ›Ûİ	œ™YÚ\İJK[Ü˜\
+
+NÂˆ]Y˜][ÈHÜš^›Û—İÛÜ›š][WÙY˜][Îœ™XY
+	œ›Ûİ
+K[Ü˜\
+
+NÂˆ]][\ÈHÜš^›Û—ØÛY[š][\Î’][\Î›ØY
+ˆ	œ›Ûİˆ	œ™YÚ\İKˆ	™˜XİËˆ	šÜš^›Û—İÛÜ››Ûİ”XÚÓİ™\›^N““Ó‘Kˆ	™Y˜][Ëˆ
+Bˆ[Ü˜\
+
+NÂˆ]›ØÚÙ]H][\Ë™Ù]
+›Z[™XÜ˜Y™š\™]ÛÜš×Ü›ØÚÙ]ŠK[Ü˜\
+
+NÂˆ\ÜÙ\Jİ\\\ÙWÙ[™×ØÛXÚÊ›ØÚÙ]YJK™ÛY[™ÈŠNÂˆ\ÜÙ\J\İ\\\ÙWÙ[™×ØÛXÚÊ›ØÚÙ]˜[ÙJK›Ûˆ›ÛİŠNÂˆËÈİ\ˆ][\È[œİÙ\ˆHØ[YHÚ]\ˆÜˆ›İH^Y\ˆÛY\Ë‚ˆ]ÚY[H][\Ë™Ù]
+›Z[™XÜ˜YœÚY[ŠK[Ü˜\
+
+NÂˆ]İXÚÈH][\Ë™Ù]
+›Z[™XÜ˜YœİXÚÈŠK[Ü˜\
+
+NÂˆ›ÜˆÛY[™È[ˆÙ˜[ÙKYWHÂˆ\ÜÙ\Jİ\\\ÙWÙ[™×ØÛXÚÊÚY[ÛY[™ÊJNÂˆ\ÜÙ\J\İ\\\ÙWÙ[™×ØÛXÚÊİXÚËÛY[™ÊJNÂˆËÈ›ÛÙÛTİXÚÒ][K\ÙH\ÜÙ\ÈÛˆHÛY[ˆ›ÈİÚ[™ÈÚ[HH›ÛÜİÛÛÛÈİÛ‹‚ˆ›Üˆ›Ù[ˆÂˆ›Z[™XÜ˜Y˜Ø\œ›İÛÛ—ØWÜİXÚÈ‹ˆ›Z[™XÜ˜YØ\œYÙ[™İ\×ÛÛ—ØWÜİXÚÈ‹ˆHÂˆ]›ÙH][\Ë™Ù]
+›Ù
+K[Ü˜\
+
+NÂˆ\ÜÙ\J\İ\\\ÙWÙ[™×ØÛXÚÊ›ÙÛY[™ÊKßH‹›ÙšY
+NÂˆBˆBˆB‚ˆËËÈÛY[XÚÙ]\İ[™\‹š[™QØ[YQ]™[ˆ™\šYH]HØ[YH]™[XÚÙ]ˆËËÈ\\È›Üˆ\œ›İÈ]Y™™\™š\Úİ[™È[™[Z]YÜ˜Y[™ÈX]Ú˜[š[K‚ˆÖİ\İBˆ›ˆØ[YWÙ]™[ØÛÛœİ[×Ø[™İ\\×ÛX]Úİ˜[š[J
+HÂˆ\ÙHÜš^›Û—Ü›İØÛÛœXÚÙ]Îœ^N‘Ø[YQ]™[ÂˆËÈ]™[\\Èœ›ÛHÛY[›İ[™Ø[YQ]™[XÚÙ]‚ˆËÈˆHVWĞT”“Õ×ÒUÔÓÕS‘ÈHRS—ÓU‘SĞÒS‘ÑKHS‘T—ÓU‘SĞÒS‘ÑKˆËÈHHQ‘‘T—Ñ’TÒÔÕS‘ËLHHSSQQPUWÔ‘TÔUÓ‹LˆHSRUQĞÔQ•S‘Ë‚ˆ]\œ›İÈHØ[YQ]™[Âˆ]™[ˆ‹ˆ\˜[NˆŒˆNÂˆ]˜Z[ˆHØ[YQ]™[Âˆ]™[ˆËˆ\˜[NˆKˆNÂˆ][™\ˆHØ[YQ]™[Âˆ]™[ˆˆ\˜[NˆŒ‹ˆNÂˆ]Y™™\ˆHØ[YQ]™[Âˆ]™[ˆKˆ\˜[NˆŒˆNÂˆ]™\Ü]ÛˆHØ[YQ]™[Âˆ]™[ˆLKˆ\˜[NˆKŒˆNÂˆ]Ü˜Y[™ÈHØ[YQ]™[Âˆ]™[ˆL‹ˆ\˜[NˆKŒˆNÂ‚ˆ\ÜÙ\Ù\HJ\œ›İË™]™[ŠNÂˆ\ÜÙ\Ù\HJ˜Z[‹™]™[ÊNÂˆ\ÜÙ\Ù\HJ[™\‹™]™[
+NÂˆ\ÜÙ\Ù\HJY™™\‹™]™[JNÂˆ\ÜÙ\Ù\HJ™\Ü]Û‹™]™[LJNÂˆ\ÜÙ\Ù\HJÜ˜Y[™Ë™]™[LŠNÂˆ\ÜÙ\JÜ˜Y[™Ëœ\˜[HOHKŒ
+NÂˆBŸB‚ˆÖØÙ™Ê\İ
+WBˆÖÜ]Hœ^Y\—İXÚ×İ\İËœœÈ—B›[Ù^Y\—İXÚ×İ\İÎÂ‚‹ËËÈÚ]\ˆHŞ[˜Ú›Ûš^™Y[Y[œÚ[Ûˆ\IÜÈ˜[Y\È\™H[œÚYHHÛÙXÉÜÈ˜[™Ù\Â‹ËËÈ
+[Y[œÚ[Û•\Kš˜]˜XˆHÛÛÜ™[˜]HØØ[HÙˆKŒKMQ˜ÈËŒMØH[Ûœİ\ˆÜ]Ûˆ›ØÚÈYÚ‹ËËÈ[Z]ÙˆÈMNÈH[XšY[YÚ\È›È˜[™ÙJKÛÈHÜ[	ÜÈ˜][ÈÙˆÛÈØØ[\È\Èš[š]K‚™›ˆØ[™WÙ˜XİÊ˜XİÎˆ	šÜš^›Û—İÛÜ›™[Y[œÚ[Û—İ\N‘[Y[œÚ[Û‘˜XİÊHOˆ›ÛÛÂˆ
+™œ›ÛJKŒKMWÙŒÌŠK‹LËŒMÊK˜ÛÛZ[œÊ	™˜XİË˜ÛÛÜ™[˜]WÜØØ[JBˆ	‰ˆ
+‹LMJK˜ÛÛZ[œÊ	™˜XİË›[Ûœİ\—ÜÜ]Û—Ø›ØÚ×ÛYÚÛ[Z]
+Bˆ	‰ˆ˜XİË˜[XšY[ÛYÚš\×Ùš[š]J
+BŸB‚ˆÖØÙ™Ê\İ
+WB›[Ù]™[Ù˜Xİ×İ\İÈÂˆ\ÙHİ\\œØ[™WÙ˜XİÎÂˆ\ÙHÜš^›Û—İÛÜ›™[Y[œÚ[Û—İ\N‘[Y[œÚ[Û‘˜XİÎÂ‚ˆËËÈH\Hİ]ÚYHHÛÙXÉÜÈ˜[™Ù\È\È›İZÙ[ÈH˜[š[HÛ™\È\™K‚ˆÖİ\İBˆ›ˆWİ\WÛİ]ÚYWİWØÛÙXÜ×Ü˜[™Ù\×Ú\×Ü™Y\ÙY
+
+HÂˆ]]]˜XİÈH[Y[œÚ[Û‘˜XİÎ›İ™\ÛÜ›
+
+K˜ÛÛ™J
+NÂˆ\ÜÙ\JØ[™WÙ˜XİÊ	™˜XİÊJNÂˆ\ÜÙ\JØ[™WÙ˜XİÊ[Y[œÚ[Û‘˜XİÎ›Ù—ØZ[[—Û]™[
+ˆÜš^›Û—ØÛÜ™N“]™[Ù^N“‘UT‚ˆ
+JJNÂˆ›ÜˆØØ[H[ˆÌŒ™œ›ÛWØš]ÊJKLKŒËŒYMË“S—HÂˆ˜XİË˜ÛÛÜ™[˜]WÜØØ[HHØØ[NÂˆ\ÜÙ\J\Ø[™WÙ˜XİÊ	™˜XİÊKÜØØ[_HŠNÂˆBˆ˜XİË˜ÛÛÜ™[˜]WÜØØ[HHKŒÂˆËÈHÛÙXÈÙ]È›È˜[™ÙHÛˆH[XšY[YÚˆ˜XİË˜[XšY[ÛYÚHKNÂˆ\ÜÙ\JØ[™WÙ˜XİÊ	™˜XİÊJNÂˆ˜XİË›[Ûœİ\—ÜÜ]Û—Ø›ØÚ×ÛYÚÛ[Z]HMÂˆ\ÜÙ\J\Ø[™WÙ˜XİÊ	™˜XİÊJNÂˆBŸB

@@ -187,7 +187,11 @@ fn run(resources: &Path) -> Result<(), String> {
     })
     .map_err(|e| format!("Control textures: {e}"))?;
     // Everything the game reads is in the resources now: the runtime and the work files go.
-    for done in [&jre, &kit.join(".local"), &temp] {
+    // The fetched official files (client and server jars, libraries and the whole asset store)
+    // go too: they are a second copy of what is prepared, and the setup fetches them again
+    // if the prepared resources are ever lost.
+    let fetched = crate::accounts::files_root();
+    for done in [&jre, &kit.join(".local"), &temp, &fetched] {
         let _ = std::fs::remove_dir_all(done);
     }
     Ok(())

@@ -31,6 +31,7 @@ pub mod handoff;
 pub mod hub;
 pub mod import;
 mod io_pool;
+pub mod mabar_skins;
 pub mod menu;
 #[cfg(test)]
 mod payload_bounds_tests;
