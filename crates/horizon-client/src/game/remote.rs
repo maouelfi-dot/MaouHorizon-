@@ -649,6 +649,8 @@ pub(super) struct Remote {
     listed: std::collections::HashSet<u128>,
     /// `ClientboundLoginPacket.onlineMode`: the player list shows heads.
     pub(super) online_mode: bool,
+    /// Mabar skins while this session is on a LAN (see `own_skin.rs`), dropped with the session.
+    pub(super) mabar: Option<horizon_client::lan::mabar_skins::Mabar>,
     /// Player entities in the level: entity id to profile UUID.
     level_players: HashMap<i32, u128>,
     /// The profile name each player entity was created with (`RemotePlayer.getGameProfile`): it outlives the
@@ -990,6 +992,10 @@ impl Game<'_> {
         lan: bool,
     ) -> Result<()> {
         self.reset_tutorial();
+        // Mabar skins: shared with the phones of a LAN, never of the internet.
+        self.set_lan_peer(
+            local.is_none() && horizon_client::lan::mabar_skins::is_private_address(address),
+        );
         self.perf.world_opening();
         // A server's own biomes come over the connection; the last local
         // world's packed table must not name its ids. The window's own
@@ -1248,6 +1254,7 @@ impl Game<'_> {
             skins: HashMap::new(),
             listed: Default::default(),
             online_mode: false,
+            mabar: None,
             level_players: HashMap::new(),
             level_player_names: HashMap::new(),
             level_player_textures: HashMap::new(),
@@ -5622,8 +5629,22 @@ impl Game<'_> {
             from_elyby.insert(local);
         }
         if !online_mode {
+            let local_name = names
+                .iter()
+                .find(|(u, _)| *u == local)
+                .map(|(_, n)| n.clone());
+            self.mabar_update(local_name.as_deref());
             for (uuid, name) in names {
                 if entries.iter().any(|(u, t)| *u == uuid && t.skin.is_some()) {
+                    continue;
+                }
+                // Mabar: the skin and cape a phone on this LAN announced for its player.
+                if uuid != local
+                    && let Some(textures) = self.mabar_textures(&name)
+                {
+                    entries.retain(|(u, _)| *u != uuid);
+                    entries.push((uuid, textures));
+                    from_elyby.insert(uuid);
                     continue;
                 }
                 if let Some(textures) = self.elyby_textures(&name) {

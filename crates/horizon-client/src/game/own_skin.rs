@@ -54,6 +54,8 @@ pub(super) struct OwnSkin {
     /// How far a drag turned it, and the drag going on: where it began and the turn then.
     title_turn: f32,
     title_drag: Option<(f32, f32)>,
+    /// Joined to a server at a private address (a LAN, a hotspot): Mabar skins run with it.
+    lan_peer: bool,
     /// Ely.by's skins by name, kept in `assets/skins/elyby.json` once read, and whether Skin
     /// Customization has them on (read on first use).
     elyby: horizon_client::elyby::Lookup,
@@ -203,6 +205,58 @@ impl Game<'_> {
             .own_skin
             .elyby_on
             .get_or_insert_with(|| horizon_client::elyby::enabled(&Self::player_dir()))
+    }
+
+    /// Joined to a LAN server (`true`) or not: the session Mabar skins run for, with a hosted LAN world.
+    pub(super) fn set_lan_peer(&mut self, on: bool) {
+        self.own_skin.lan_peer = on;
+    }
+
+    /// Mabar skins: while this world is open to LAN, or joined at a private address, this phone
+    /// tells the others its player's skin and cape and hears theirs, so offline players see one
+    /// another (what Maou Launcher's Mabar does). It runs only then: alone on any network it
+    /// announces nothing. The look is the one chosen in Skin Customization, else the launcher's
+    /// offline skin; None of either shares nothing.
+    pub(super) fn mabar_update(&mut self, local_name: Option<&str>) {
+        let active = self.lan.is_some() || self.own_skin.lan_peer;
+        let Some(name) = local_name.filter(|_| active) else {
+            if let Some(r) = self.remote.as_mut() {
+                r.mabar = None;
+            }
+            return;
+        };
+        let (image, slim) = match &self.own_skin.image {
+            Some(image) => (Some(image.clone()), self.own_skin.choice.slim),
+            None => match horizon_client::skins::offline_skin() {
+                Some((rgba, slim)) => (Some(rgba.clone()), *slim),
+                None => (None, false),
+            },
+        };
+        let name = name.to_owned();
+        let Some(r) = self.remote.as_mut() else {
+            return;
+        };
+        use horizon_client::lan::mabar_skins::{Look, Mabar, encode_png};
+        r.mabar.get_or_insert_with(Mabar::start).update(|| Look {
+            name,
+            skin: image.and_then(|rgba| encode_png(64, 64, &rgba)),
+            slim,
+            // The cape sits in the top half of its 64x64 slot.
+            cape: horizon_client::skins::offline_cape()
+                .and_then(|rgba| rgba.get(..64 * 32 * 4))
+                .and_then(|top| encode_png(64, 32, top)),
+        });
+    }
+
+    /// The skin and cape a phone on this LAN announced for `name`, if it did.
+    pub(super) fn mabar_textures(&self, name: &str) -> Option<horizon_client::skins::Textures> {
+        let look = self.remote.as_ref()?.mabar.as_ref()?.look_of(name)?;
+        Some(horizon_client::skins::Textures {
+            skin: Some(look.skin?),
+            slim: look.slim,
+            cape: look.cape,
+            ..Default::default()
+        })
     }
 
     /// `name`'s skin on Ely.by, where Skin Customization has Ely.by Skins on and it answered.
