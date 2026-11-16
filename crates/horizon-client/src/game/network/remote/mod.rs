@@ -1706,6 +1706,7 @@ impl Game<'_> {
             listed: Default::default(),
             online_mode: false,
             levels: Vec::new(),
+            mabar: None,
             level_players: HashMap::new(),
             level_player_names: HashMap::new(),
             level_player_textures: HashMap::new(),
